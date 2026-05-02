@@ -1,0 +1,881 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CXQ_VERSION="0.1.0"
+
+die() {
+  printf 'cxq: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+cxq - local Codex task queue
+
+Usage:
+  cxq -v | --version
+  cxq help
+  cxq install
+  cxq add <title> [options]
+  cxq list [--all] [--status <status>]
+  cxq next [--format text|id|md]
+  cxq claim <id> [--agent <name>] [--lease <duration>]
+  cxq note <id> <note>
+  cxq prompt <id>
+  cxq review <id> --summary <summary>
+  cxq done <id> [--summary <summary>]
+  cxq repo <id>
+  cxq stale
+  cxq release <id>
+
+Add options:
+  --priority <n>        Priority, default 50
+  --status <status>    inbox, ready, claimed, blocked, review, done, wontfix
+  --body <text>        Extra task body
+  --files <paths>      Comma-separated allowed paths
+  --tag <tag>          Add a tag. Can be repeated.
+  --acceptance <text>  Acceptance criteria
+  --verify <command>   Verification command
+
+Examples:
+  cxq install
+  cxq add "Fix flaky auth refresh test" --priority 80 --files "src/auth,tests/auth"
+  cxq next --format md
+  cxq claim 42 --agent codex --lease 2h
+EOF
+}
+
+version() {
+  printf 'cxq %s\n' "$CXQ_VERSION"
+}
+
+require_macos() {
+  if [ "$(uname -s)" != "Darwin" ]; then
+    die "cxq currently supports macOS only."
+  fi
+}
+
+require_sqlite3() {
+  command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 is required but was not found."
+}
+
+trim() {
+  local value=${1-}
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+sql_quote() {
+  local value=${1-}
+  value=${value//\'/\'\'}
+  printf "'%s'" "$value"
+}
+
+json_escape() {
+  local value=${1-}
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
+csv_to_json_array() {
+  local input=${1-}
+  local out="["
+  local first=1
+  local part value escaped
+
+  if [ -n "$input" ]; then
+    local old_ifs=$IFS
+    IFS=','
+    for part in $input; do
+      value=$(trim "$part")
+      if [ -n "$value" ]; then
+        escaped=$(json_escape "$value")
+        if [ "$first" -eq 0 ]; then
+          out="${out},"
+        fi
+        out="${out}\"${escaped}\""
+        first=0
+      fi
+    done
+    IFS=$old_ifs
+  fi
+
+  out="${out}]"
+  printf '%s' "$out"
+}
+
+status_is_valid() {
+  case "${1-}" in
+    inbox|ready|claimed|blocked|review|done|wontfix) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+git_root() {
+  git rev-parse --show-toplevel 2>/dev/null
+}
+
+physical_path() {
+  (cd "$1" >/dev/null 2>&1 && pwd -P)
+}
+
+project_root_or_die() {
+  local root
+  root=$(git_root) || die "cxq only runs inside Git projects."
+  physical_path "$root"
+}
+
+install_root_or_die() {
+  local root current
+  root=$(git_root) || {
+    printf 'cxq install only runs at the root of a Git project.\n' >&2
+    exit 1
+  }
+  root=$(physical_path "$root")
+  current=$(pwd -P)
+  if [ "$root" != "$current" ]; then
+    printf 'cxq install only runs at the root of a Git project.\n' >&2
+    exit 1
+  fi
+  printf '%s' "$root"
+}
+
+db_path_or_die() {
+  local root db
+  root=$(project_root_or_die)
+  db="$root/.codex/tasks.db"
+  [ -f "$db" ] || die "cxq is not installed in this project. Run 'cxq install' at the Git root."
+  printf '%s' "$db"
+}
+
+schema_sql() {
+  cat <<'EOF'
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+
+  status TEXT NOT NULL DEFAULT 'inbox'
+    CHECK (status IN (
+      'inbox',
+      'ready',
+      'claimed',
+      'blocked',
+      'review',
+      'done',
+      'wontfix'
+    )),
+
+  priority INTEGER NOT NULL DEFAULT 50,
+
+  repo_path TEXT NOT NULL,
+  branch TEXT,
+
+  allowed_paths_json TEXT NOT NULL DEFAULT '[]',
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  deps_json TEXT NOT NULL DEFAULT '[]',
+
+  acceptance TEXT NOT NULL DEFAULT '',
+  verify_command TEXT NOT NULL DEFAULT '',
+
+  claimed_by TEXT,
+  claimed_at TEXT,
+  lease_until TEXT,
+
+  result_summary TEXT NOT NULL DEFAULT '',
+  transcript_path TEXT,
+
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status_priority
+ON tasks(status, priority DESC, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_repo_status
+ON tasks(repo_path, status);
+
+CREATE TABLE IF NOT EXISTS task_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+
+  event_type TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  data_json TEXT NOT NULL DEFAULT '{}',
+
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_events_task_created
+ON task_events(task_id, created_at);
+
+CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
+AFTER UPDATE ON tasks
+FOR EACH ROW
+BEGIN
+  UPDATE tasks
+  SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  WHERE id = OLD.id;
+END;
+EOF
+}
+
+prompt_template() {
+  cat <<'EOF'
+You are working on a local cxq task.
+
+Use `cxq prompt <id>` to render the full current task prompt.
+Use `cxq note <id> "..."` for important discoveries.
+Move completed implementation work to `review`, not `done`, unless a human
+explicitly asks you to mark it done.
+EOF
+}
+
+agents_contract() {
+  cat <<'EOF'
+
+## Local task queue
+
+This repo uses a local Codex task queue.
+
+Use `cxq` to read and update tasks. Do not edit `.codex/tasks.db` directly.
+
+Before starting queued work:
+
+1. Run `cxq next --format md`.
+2. Claim exactly one task with `cxq claim <id> --agent codex`.
+3. Work only on the claimed task.
+4. Respect `allowed_paths` unless the task clearly requires more scope.
+5. Run the task's `verify_command` when present.
+6. Add notes with `cxq note <id> "..."`.
+7. End by moving the task to `review`, with:
+   - files changed
+   - tests run
+   - remaining risks
+   - suggested next step
+
+Never mark a task `done` unless explicitly instructed.
+EOF
+}
+
+sqlite_exec() {
+  local db=$1
+  local sql=$2
+  sqlite3 -batch "$db" "$sql"
+}
+
+sqlite_value() {
+  local db=$1
+  local sql=$2
+  sqlite3 -batch -noheader "$db" "$sql"
+}
+
+log_event() {
+  local db=$1
+  local task_id=$2
+  local event_type=$3
+  local actor=$4
+  local note=${5-}
+  local data_json=${6:-{}}
+  sqlite_exec "$db" "INSERT INTO task_events (task_id, event_type, actor, note, data_json) VALUES ($task_id, $(sql_quote "$event_type"), $(sql_quote "$actor"), $(sql_quote "$note"), $(sql_quote "$data_json"));"
+}
+
+append_gitignore() {
+  local file=$1
+  touch "$file"
+  if ! grep -qxF ".codex/tasks.db" "$file"; then
+    {
+      printf '\n# cxq local queue\n'
+      printf '.codex/tasks.db\n'
+      printf '.codex/tasks.db-*\n'
+    } >>"$file"
+  elif ! grep -qxF ".codex/tasks.db-*" "$file"; then
+    printf '.codex/tasks.db-*\n' >>"$file"
+  fi
+}
+
+append_agents_contract() {
+  local file=$1
+  touch "$file"
+  if ! grep -qxF "## Local task queue" "$file"; then
+    agents_contract >>"$file"
+  fi
+}
+
+cmd_install() {
+  require_macos
+  require_sqlite3
+
+  local root codex_dir schema_file prompt_dir prompt_file db
+  root=$(install_root_or_die)
+  codex_dir="$root/.codex"
+  schema_file="$codex_dir/tasks.schema.sql"
+  prompt_dir="$codex_dir/prompts"
+  prompt_file="$prompt_dir/task.md"
+  db="$codex_dir/tasks.db"
+
+  mkdir -p "$prompt_dir"
+  schema_sql >"$schema_file"
+  prompt_template >"$prompt_file"
+  sqlite3 -batch "$db" <"$schema_file" >/dev/null
+  append_gitignore "$root/.gitignore"
+  append_agents_contract "$root/AGENTS.md"
+
+  printf 'cxq installed for project: %s\n' "$root"
+  printf 'Database: %s\n' "$db"
+}
+
+current_actor() {
+  printf '%s' "${USER:-unknown}"
+}
+
+current_branch() {
+  local root=$1
+  git -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null || true
+}
+
+cmd_add() {
+  require_sqlite3
+
+  local title="" body="" priority=50 status="ready" files="" tags="" acceptance="" verify=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --priority)
+        [ "$#" -ge 2 ] || die "--priority requires a value."
+        priority=$2
+        shift 2
+        ;;
+      --status)
+        [ "$#" -ge 2 ] || die "--status requires a value."
+        status=$2
+        shift 2
+        ;;
+      --body)
+        [ "$#" -ge 2 ] || die "--body requires a value."
+        body=$2
+        shift 2
+        ;;
+      --files|--allowed-paths)
+        [ "$#" -ge 2 ] || die "$1 requires a value."
+        files=$2
+        shift 2
+        ;;
+      --tag)
+        [ "$#" -ge 2 ] || die "--tag requires a value."
+        tags="${tags}${tags:+,}$2"
+        shift 2
+        ;;
+      --acceptance)
+        [ "$#" -ge 2 ] || die "--acceptance requires a value."
+        acceptance=$2
+        shift 2
+        ;;
+      --verify|--verify-command)
+        [ "$#" -ge 2 ] || die "$1 requires a value."
+        verify=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --*)
+        die "unknown add option: $1"
+        ;;
+      *)
+        if [ -z "$title" ]; then
+          title=$1
+        else
+          body="${body}${body:+ }$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$title" ] || die "task title is required."
+  [[ "$priority" =~ ^[0-9]+$ ]] || die "priority must be an integer."
+  status_is_valid "$status" || die "invalid status: $status"
+
+  local root db branch files_json tags_json id actor
+  root=$(project_root_or_die)
+  db=$(db_path_or_die)
+  branch=$(current_branch "$root")
+  files_json=$(csv_to_json_array "$files")
+  tags_json=$(csv_to_json_array "$tags")
+  actor=$(current_actor)
+
+  id=$(sqlite_value "$db" "INSERT INTO tasks (title, body, status, priority, repo_path, branch, allowed_paths_json, tags_json, acceptance, verify_command) VALUES ($(sql_quote "$title"), $(sql_quote "$body"), $(sql_quote "$status"), $priority, $(sql_quote "$root"), $(sql_quote "$branch"), $(sql_quote "$files_json"), $(sql_quote "$tags_json"), $(sql_quote "$acceptance"), $(sql_quote "$verify")); SELECT last_insert_rowid();")
+  log_event "$db" "$id" "created" "$actor" "$title"
+  printf 'Created task #%s\n' "$id"
+}
+
+format_task_text() {
+  local db=$1
+  local id=$2
+  sqlite3 -batch -header -column "$db" "SELECT id, status, priority, title, claimed_by, lease_until FROM tasks WHERE id = $id;"
+}
+
+print_json_array_md() {
+  local db=$1
+  local id=$2
+  local column=$3
+  local values
+  values=$(sqlite3 -batch -noheader "$db" "SELECT '- ' || value FROM json_each((SELECT $column FROM tasks WHERE id = $id));" 2>/dev/null || true)
+  if [ -n "$values" ]; then
+    printf '%s\n' "$values"
+  else
+    printf 'None\n'
+  fi
+}
+
+render_task_md() {
+  local db=$1
+  local id=$2
+  local title status priority body acceptance verify claimed_by lease_until
+
+  title=$(sqlite_value "$db" "SELECT title FROM tasks WHERE id = $id;")
+  [ -n "$title" ] || die "task not found: $id"
+  status=$(sqlite_value "$db" "SELECT status FROM tasks WHERE id = $id;")
+  priority=$(sqlite_value "$db" "SELECT priority FROM tasks WHERE id = $id;")
+  body=$(sqlite_value "$db" "SELECT body FROM tasks WHERE id = $id;")
+  acceptance=$(sqlite_value "$db" "SELECT acceptance FROM tasks WHERE id = $id;")
+  verify=$(sqlite_value "$db" "SELECT verify_command FROM tasks WHERE id = $id;")
+  claimed_by=$(sqlite_value "$db" "SELECT COALESCE(claimed_by, '') FROM tasks WHERE id = $id;")
+  lease_until=$(sqlite_value "$db" "SELECT COALESCE(lease_until, '') FROM tasks WHERE id = $id;")
+
+  printf '# Task #%s\n\n' "$id"
+  printf '## Title\n%s\n\n' "$title"
+  printf '## Status\n%s\n\n' "$status"
+  printf '## Priority\n%s\n\n' "$priority"
+
+  if [ -n "$body" ]; then
+    printf '## Body\n%s\n\n' "$body"
+  fi
+
+  printf '## Allowed paths\n'
+  print_json_array_md "$db" "$id" "allowed_paths_json"
+  printf '\n'
+
+  printf '## Acceptance criteria\n'
+  if [ -n "$acceptance" ]; then
+    printf '%s\n' "$acceptance"
+  else
+    printf 'None\n'
+  fi
+  printf '\n'
+
+  printf '## Verification command\n'
+  if [ -n "$verify" ]; then
+    printf '%s\n' "$verify"
+  else
+    printf 'None\n'
+  fi
+  printf '\n'
+
+  if [ -n "$claimed_by" ] || [ -n "$lease_until" ]; then
+    printf '## Claim\n'
+    [ -n "$claimed_by" ] && printf 'Claimed by: %s\n' "$claimed_by"
+    [ -n "$lease_until" ] && printf 'Lease until: %s\n' "$lease_until"
+    printf '\n'
+  fi
+}
+
+task_exists() {
+  local db=$1
+  local id=$2
+  local count
+  count=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE id = $id;")
+  [ "$count" = "1" ]
+}
+
+require_task_id() {
+  local id=${1-}
+  [[ "$id" =~ ^[0-9]+$ ]] || die "task id must be an integer."
+}
+
+cmd_list() {
+  require_sqlite3
+
+  local include_all=0 status=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --all)
+        include_all=1
+        shift
+        ;;
+      --status)
+        [ "$#" -ge 2 ] || die "--status requires a value."
+        status=$2
+        status_is_valid "$status" || die "invalid status: $status"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown list option: $1"
+        ;;
+    esac
+  done
+
+  local db where
+  db=$(db_path_or_die)
+  if [ -n "$status" ]; then
+    where="status = $(sql_quote "$status")"
+  elif [ "$include_all" -eq 1 ]; then
+    where="1 = 1"
+  else
+    where="status NOT IN ('done', 'wontfix')"
+  fi
+
+  sqlite3 -batch -header -column "$db" "SELECT id, status, priority, title, COALESCE(claimed_by, '') AS claimed_by, COALESCE(lease_until, '') AS lease_until FROM tasks WHERE $where ORDER BY CASE status WHEN 'ready' THEN 0 WHEN 'claimed' THEN 1 WHEN 'review' THEN 2 WHEN 'blocked' THEN 3 WHEN 'inbox' THEN 4 ELSE 5 END, priority DESC, created_at ASC;"
+}
+
+cmd_next() {
+  require_sqlite3
+
+  local format="text"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --format)
+        [ "$#" -ge 2 ] || die "--format requires a value."
+        format=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown next option: $1"
+        ;;
+    esac
+  done
+
+  case "$format" in
+    text|id|md) ;;
+    *) die "invalid format: $format" ;;
+  esac
+
+  local db id
+  db=$(db_path_or_die)
+  id=$(sqlite_value "$db" "SELECT id FROM tasks WHERE status = 'ready' AND deps_json = '[]' ORDER BY priority DESC, created_at ASC LIMIT 1;")
+  if [ -z "$id" ]; then
+    printf 'No ready tasks.\n' >&2
+    exit 1
+  fi
+
+  case "$format" in
+    id) printf '%s\n' "$id" ;;
+    md) render_task_md "$db" "$id" ;;
+    text) format_task_text "$db" "$id" ;;
+  esac
+}
+
+lease_modifier() {
+  local lease=${1:-2h}
+  if [[ "$lease" =~ ^([0-9]+)m$ ]]; then
+    printf '+%s minutes' "${BASH_REMATCH[1]}"
+  elif [[ "$lease" =~ ^([0-9]+)h$ ]]; then
+    printf '+%s hours' "${BASH_REMATCH[1]}"
+  elif [[ "$lease" =~ ^([0-9]+)d$ ]]; then
+    printf '+%s days' "${BASH_REMATCH[1]}"
+  else
+    die "lease must look like 30m, 2h, or 1d."
+  fi
+}
+
+cmd_claim() {
+  require_sqlite3
+  [ "$#" -ge 1 ] || die "task id is required."
+
+  local id=$1 agent="codex" lease="2h"
+  require_task_id "$id"
+  shift
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --agent)
+        [ "$#" -ge 2 ] || die "--agent requires a value."
+        agent=$2
+        shift 2
+        ;;
+      --lease)
+        [ "$#" -ge 2 ] || die "--lease requires a value."
+        lease=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown claim option: $1"
+        ;;
+    esac
+  done
+
+  local db modifier changed
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  modifier=$(lease_modifier "$lease")
+
+  changed=$(sqlite_value "$db" "UPDATE tasks SET status = 'claimed', claimed_by = $(sql_quote "$agent"), claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', $(sql_quote "$modifier")) WHERE id = $id AND (status IN ('ready', 'inbox') OR (status = 'claimed' AND lease_until IS NOT NULL AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))); SELECT changes();")
+  if [ "$changed" = "0" ]; then
+    die "task $id is not available to claim."
+  fi
+
+  log_event "$db" "$id" "claimed" "$agent" "lease $lease"
+  printf 'Claimed task #%s as %s\n' "$id" "$agent"
+}
+
+cmd_note() {
+  require_sqlite3
+  [ "$#" -ge 2 ] || die "usage: cxq note <id> <note>"
+
+  local id=$1
+  require_task_id "$id"
+  shift
+
+  local note="$*"
+  local db actor
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  actor=$(current_actor)
+  log_event "$db" "$id" "note" "$actor" "$note"
+  printf 'Noted task #%s\n' "$id"
+}
+
+cmd_prompt() {
+  require_sqlite3
+  [ "$#" -eq 1 ] || die "usage: cxq prompt <id>"
+
+  local id=$1
+  require_task_id "$id"
+
+  local db title status acceptance verify
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  title=$(sqlite_value "$db" "SELECT title FROM tasks WHERE id = $id;")
+  status=$(sqlite_value "$db" "SELECT status FROM tasks WHERE id = $id;")
+  acceptance=$(sqlite_value "$db" "SELECT acceptance FROM tasks WHERE id = $id;")
+  verify=$(sqlite_value "$db" "SELECT verify_command FROM tasks WHERE id = $id;")
+
+  printf 'You are working on local task #%s.\n\n' "$id"
+  printf 'Title:\n%s\n\n' "$title"
+  printf 'Status:\n%s\n\n' "$status"
+  printf 'Allowed paths:\n'
+  print_json_array_md "$db" "$id" "allowed_paths_json"
+  printf '\n'
+  printf 'Acceptance criteria:\n'
+  if [ -n "$acceptance" ]; then
+    printf '%s\n' "$acceptance"
+  else
+    printf 'None\n'
+  fi
+  printf '\n'
+  printf 'Verification command:\n'
+  if [ -n "$verify" ]; then
+    printf '%s\n' "$verify"
+  else
+    printf 'None\n'
+  fi
+  printf '\n'
+  cat <<EOF
+Instructions:
+- Work only on this task.
+- Respect allowed paths unless the implementation clearly requires more scope.
+- Use \`cxq note $id "..."\` for important discoveries.
+- Run the verification command when present.
+- When finished, move the task to review:
+  \`cxq review $id --summary "..."\`
+- Do not mark the task done.
+EOF
+}
+
+cmd_review() {
+  require_sqlite3
+  [ "$#" -ge 1 ] || die "task id is required."
+
+  local id=$1 summary=""
+  require_task_id "$id"
+  shift
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --summary)
+        [ "$#" -ge 2 ] || die "--summary requires a value."
+        summary=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        summary="${summary}${summary:+ }$1"
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$summary" ] || die "review summary is required."
+
+  local db actor
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  actor=$(current_actor)
+  sqlite_exec "$db" "UPDATE tasks SET status = 'review', result_summary = $(sql_quote "$summary"), lease_until = NULL WHERE id = $id;"
+  log_event "$db" "$id" "review" "$actor" "$summary"
+  printf 'Moved task #%s to review\n' "$id"
+}
+
+cmd_done() {
+  require_sqlite3
+  [ "$#" -ge 1 ] || die "task id is required."
+
+  local id=$1 summary=""
+  require_task_id "$id"
+  shift
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --summary)
+        [ "$#" -ge 2 ] || die "--summary requires a value."
+        summary=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        summary="${summary}${summary:+ }$1"
+        shift
+        ;;
+    esac
+  done
+
+  local db actor
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  actor=$(current_actor)
+  sqlite_exec "$db" "UPDATE tasks SET status = 'done', result_summary = CASE WHEN $(sql_quote "$summary") = '' THEN result_summary ELSE $(sql_quote "$summary") END, lease_until = NULL WHERE id = $id;"
+  log_event "$db" "$id" "done" "$actor" "$summary"
+  printf 'Marked task #%s done\n' "$id"
+}
+
+cmd_repo() {
+  require_sqlite3
+  [ "$#" -eq 1 ] || die "usage: cxq repo <id>"
+
+  local id=$1 db repo
+  require_task_id "$id"
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  repo=$(sqlite_value "$db" "SELECT repo_path FROM tasks WHERE id = $id;")
+  printf '%s\n' "$repo"
+}
+
+cmd_stale() {
+  require_sqlite3
+  local db
+  db=$(db_path_or_die)
+  sqlite3 -batch -header -column "$db" "SELECT id, status, priority, title, claimed_by, lease_until FROM tasks WHERE status = 'claimed' AND lease_until IS NOT NULL AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ORDER BY lease_until ASC;"
+}
+
+cmd_release() {
+  require_sqlite3
+  [ "$#" -eq 1 ] || die "usage: cxq release <id>"
+
+  local id=$1 db actor changed
+  require_task_id "$id"
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  changed=$(sqlite_value "$db" "UPDATE tasks SET status = 'ready', claimed_by = NULL, claimed_at = NULL, lease_until = NULL WHERE id = $id AND status = 'claimed'; SELECT changes();")
+  if [ "$changed" = "0" ]; then
+    die "task $id is not claimed."
+  fi
+  actor=$(current_actor)
+  log_event "$db" "$id" "released" "$actor" ""
+  printf 'Released task #%s\n' "$id"
+}
+
+main() {
+  local command=${1:-help}
+  case "$command" in
+    -v|--version|version)
+      version
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    install)
+      shift
+      [ "$#" -eq 0 ] || die "install does not accept arguments."
+      cmd_install
+      ;;
+    add)
+      shift
+      cmd_add "$@"
+      ;;
+    list|ls)
+      shift
+      cmd_list "$@"
+      ;;
+    next)
+      shift
+      cmd_next "$@"
+      ;;
+    claim)
+      shift
+      cmd_claim "$@"
+      ;;
+    note)
+      shift
+      cmd_note "$@"
+      ;;
+    prompt)
+      shift
+      cmd_prompt "$@"
+      ;;
+    review)
+      shift
+      cmd_review "$@"
+      ;;
+    done)
+      shift
+      cmd_done "$@"
+      ;;
+    repo)
+      shift
+      cmd_repo "$@"
+      ;;
+    stale)
+      shift
+      [ "$#" -eq 0 ] || die "stale does not accept arguments."
+      cmd_stale
+      ;;
+    release)
+      shift
+      cmd_release "$@"
+      ;;
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"
