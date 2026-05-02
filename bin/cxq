@@ -89,11 +89,11 @@ csv_to_json_array() {
   local out="["
   local first=1
   local part value escaped
+  local parts=()
 
   if [ -n "$input" ]; then
-    local old_ifs=$IFS
-    IFS=','
-    for part in $input; do
+    IFS=',' read -r -a parts <<<"$input"
+    for part in "${parts[@]}"; do
       value=$(trim "$part")
       if [ -n "$value" ]; then
         escaped=$(json_escape "$value")
@@ -104,7 +104,6 @@ csv_to_json_array() {
         first=0
       fi
     done
-    IFS=$old_ifs
   fi
 
   out="${out}]"

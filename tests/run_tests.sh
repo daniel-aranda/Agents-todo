@@ -338,6 +338,26 @@ test_release_clears_claim_fields() {
   pass "release clears current claim fields"
 }
 
+test_files_globs_are_preserved_literally() {
+  local repo add_output id prompt
+  repo="$TEST_DIR/glob-paths"
+  run_git_init "$repo"
+  mkdir -p "$repo/src/auth" "$repo/tests/auth"
+  touch "$repo/src/auth/a" "$repo/src/auth/b" "$repo/tests/auth/t"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  add_output=$(cd "$repo" && "$CXQ" add "Glob paths" --files "src/auth/*,tests/auth/*")
+  id=${add_output##*#}
+  prompt=$(cd "$repo" && "$CXQ" prompt "$id")
+
+  assert_contains "$prompt" "src/auth/*"
+  assert_contains "$prompt" "tests/auth/*"
+  assert_not_contains "$prompt" "src/auth/a"
+  assert_not_contains "$prompt" "src/auth/b"
+  assert_not_contains "$prompt" "tests/auth/t"
+  pass "file globs are preserved literally in allowed paths"
+}
+
 test_commands_work_from_repo_subdirectory_after_install() {
   local repo output
   repo="$TEST_DIR/subdir-use"
@@ -364,6 +384,7 @@ test_claim_next_reclaims_expired_task
 test_claim_next_second_attempt_fails_cleanly
 test_claim_next_prompt_lifecycle
 test_release_clears_claim_fields
+test_files_globs_are_preserved_literally
 test_commands_work_from_repo_subdirectory_after_install
 
 printf '\n%s tests passed\n' "$PASS"
