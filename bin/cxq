@@ -19,7 +19,9 @@ Usage:
   cxq add <title> [options]
   cxq list [--all] [--status <status>]
   cxq next [--format text|id|md]
+  cxq show <id>
   cxq claim <id> [--agent <name>] [--lease <duration>]
+  cxq claim-next [--agent <name>] [--lease <duration>] [--format id|md|prompt]
   cxq note <id> <note>
   cxq prompt <id>
   cxq review <id> --summary <summary>
@@ -41,7 +43,7 @@ Examples:
   cxq install
   cxq add "Fix flaky auth refresh test" --priority 80 --files "src/auth,tests/auth"
   cxq next --format md
-  cxq claim 42 --agent codex --lease 2h
+  cxq claim-next --agent codex --lease 2h --format prompt
 EOF
 }
 
@@ -252,13 +254,12 @@ Use `cxq` to read and update tasks. Do not edit `.codex/tasks.db` directly.
 
 Before starting queued work:
 
-1. Run `cxq next --format md`.
-2. Claim exactly one task with `cxq claim <id> --agent codex`.
-3. Work only on the claimed task.
-4. Respect `allowed_paths` unless the task clearly requires more scope.
-5. Run the task's `verify_command` when present.
-6. Add notes with `cxq note <id> "..."`.
-7. End by moving the task to `review`, with:
+1. Claim exactly one task with `cxq claim-next --agent codex --lease 2h --format prompt`.
+2. Work only on the claimed task.
+3. Respect `allowed_paths` unless the task clearly requires more scope.
+4. Run the task's `verify_command` when present.
+5. Add notes with `cxq note <id> "..."`.
+6. End by moving the task to `review`, with:
    - files changed
    - tests run
    - remaining risks
@@ -312,6 +313,20 @@ append_agents_contract() {
   fi
 }
 
+write_file_if_missing() {
+  local file=$1
+  local label=$2
+  local writer=$3
+
+  if [ -f "$file" ]; then
+    printf 'Left unchanged: %s\n' "$label"
+    return
+  fi
+
+  "$writer" >"$file"
+  printf 'Created: %s\n' "$label"
+}
+
 cmd_install() {
   require_macos
   require_sqlite3
@@ -325,9 +340,9 @@ cmd_install() {
   db="$codex_dir/tasks.db"
 
   mkdir -p "$prompt_dir"
-  schema_sql >"$schema_file"
-  prompt_template >"$prompt_file"
-  sqlite3 -batch "$db" <"$schema_file" >/dev/null
+  write_file_if_missing "$schema_file" ".codex/tasks.schema.sql" schema_sql
+  write_file_if_missing "$prompt_file" ".codex/prompts/task.md" prompt_template
+  schema_sql | sqlite3 -batch "$db" >/dev/null
   append_gitignore "$root/.gitignore"
   append_agents_contract "$root/AGENTS.md"
 
@@ -439,10 +454,10 @@ print_json_array_md() {
   fi
 }
 
-render_task_md() {
+render_task_core() {
   local db=$1
   local id=$2
-  local title status priority body acceptance verify claimed_by lease_until
+  local title status priority body acceptance verify claimed_by claimed_at lease_until result_summary
 
   title=$(sqlite_value "$db" "SELECT title FROM tasks WHERE id = $id;")
   [ -n "$title" ] || die "task not found: $id"
@@ -452,19 +467,29 @@ render_task_md() {
   acceptance=$(sqlite_value "$db" "SELECT acceptance FROM tasks WHERE id = $id;")
   verify=$(sqlite_value "$db" "SELECT verify_command FROM tasks WHERE id = $id;")
   claimed_by=$(sqlite_value "$db" "SELECT COALESCE(claimed_by, '') FROM tasks WHERE id = $id;")
+  claimed_at=$(sqlite_value "$db" "SELECT COALESCE(claimed_at, '') FROM tasks WHERE id = $id;")
   lease_until=$(sqlite_value "$db" "SELECT COALESCE(lease_until, '') FROM tasks WHERE id = $id;")
+  result_summary=$(sqlite_value "$db" "SELECT result_summary FROM tasks WHERE id = $id;")
 
   printf '# Task #%s\n\n' "$id"
   printf '## Title\n%s\n\n' "$title"
   printf '## Status\n%s\n\n' "$status"
   printf '## Priority\n%s\n\n' "$priority"
 
+  printf '## Body\n'
   if [ -n "$body" ]; then
-    printf '## Body\n%s\n\n' "$body"
+    printf '%s\n' "$body"
+  else
+    printf 'None\n'
   fi
+  printf '\n'
 
   printf '## Allowed paths\n'
   print_json_array_md "$db" "$id" "allowed_paths_json"
+  printf '\n'
+
+  printf '## Tags\n'
+  print_json_array_md "$db" "$id" "tags_json"
   printf '\n'
 
   printf '## Acceptance criteria\n'
@@ -486,9 +511,67 @@ render_task_md() {
   if [ -n "$claimed_by" ] || [ -n "$lease_until" ]; then
     printf '## Claim\n'
     [ -n "$claimed_by" ] && printf 'Claimed by: %s\n' "$claimed_by"
+    [ -n "$claimed_at" ] && printf 'Claimed at: %s\n' "$claimed_at"
     [ -n "$lease_until" ] && printf 'Lease until: %s\n' "$lease_until"
     printf '\n'
   fi
+
+  if [ -n "$result_summary" ]; then
+    printf '## Result summary\n%s\n\n' "$result_summary"
+  fi
+}
+
+render_task_events() {
+  local db=$1
+  local id=$2
+  local events
+
+  events=$(sqlite3 -batch -noheader "$db" "SELECT '- ' || created_at || ' \`' || event_type || '\` by ' || actor || CASE WHEN note <> '' THEN ': ' || replace(note, char(10), ' ') ELSE '' END FROM (SELECT id, created_at, event_type, actor, note FROM task_events WHERE task_id = $id ORDER BY created_at DESC, id DESC LIMIT 10) ORDER BY created_at ASC, id ASC;")
+
+  printf '## Recent events\n'
+  if [ -n "$events" ]; then
+    printf '%s\n' "$events"
+  else
+    printf 'None\n'
+  fi
+  printf '\n'
+}
+
+render_agent_instructions() {
+  local id=$1
+
+  cat <<EOF
+## Agent instructions
+- Work only on this task.
+- Respect allowed paths unless the implementation clearly requires more scope.
+- Run the verification command when present.
+- Use \`cxq note $id "..."\` for important discoveries.
+- Move implementation work to \`review\`, not \`done\`:
+  \`cxq review $id --summary "..."\`
+EOF
+}
+
+render_task_md() {
+  local db=$1
+  local id=$2
+  render_task_core "$db" "$id"
+}
+
+render_task_show() {
+  local db=$1
+  local id=$2
+  render_task_core "$db" "$id"
+  render_task_events "$db" "$id"
+}
+
+render_task_prompt() {
+  local db=$1
+  local id=$2
+
+  printf 'You are working on local task #%s.\n\n' "$id"
+  render_task_core "$db" "$id"
+  render_task_events "$db" "$id"
+  render_agent_instructions "$id"
 }
 
 task_exists() {
@@ -584,6 +667,17 @@ cmd_next() {
   esac
 }
 
+cmd_show() {
+  require_sqlite3
+  [ "$#" -eq 1 ] || die "usage: cxq show <id>"
+
+  local id=$1 db
+  require_task_id "$id"
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  render_task_show "$db" "$id"
+}
+
 lease_modifier() {
   local lease=${1:-2h}
   if [[ "$lease" =~ ^([0-9]+)m$ ]]; then
@@ -641,6 +735,84 @@ cmd_claim() {
   printf 'Claimed task #%s as %s\n' "$id" "$agent"
 }
 
+cmd_claim_next() {
+  require_sqlite3
+
+  local agent="codex" lease="2h" format="id"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --agent)
+        [ "$#" -ge 2 ] || die "--agent requires a value."
+        agent=$2
+        shift 2
+        ;;
+      --lease)
+        [ "$#" -ge 2 ] || die "--lease requires a value."
+        lease=$2
+        shift 2
+        ;;
+      --format)
+        [ "$#" -ge 2 ] || die "--format requires a value."
+        format=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown claim-next option: $1"
+        ;;
+    esac
+  done
+
+  case "$format" in
+    id|md|prompt) ;;
+    *) die "invalid format: $format" ;;
+  esac
+
+  local db modifier id sql
+  db=$(db_path_or_die)
+  modifier=$(lease_modifier "$lease")
+  sql="
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE cxq_claim_next_selection (id INTEGER PRIMARY KEY);
+INSERT INTO cxq_claim_next_selection (id)
+SELECT id
+FROM tasks
+WHERE status = 'ready'
+   OR (
+    status = 'claimed'
+    AND lease_until IS NOT NULL
+    AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   )
+ORDER BY priority DESC, created_at ASC
+LIMIT 1;
+UPDATE tasks
+SET status = 'claimed',
+    claimed_by = $(sql_quote "$agent"),
+    claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', $(sql_quote "$modifier"))
+WHERE id IN (SELECT id FROM cxq_claim_next_selection);
+INSERT INTO task_events (task_id, event_type, actor, note, data_json)
+SELECT id, 'claimed', $(sql_quote "$agent"), $(sql_quote "lease $lease"), '{\"source\":\"claim-next\"}'
+FROM cxq_claim_next_selection;
+SELECT id FROM cxq_claim_next_selection;
+COMMIT;
+"
+  id=$(sqlite3 -batch -noheader "$db" "$sql")
+  if [ -z "$id" ]; then
+    printf 'No available tasks.\n' >&2
+    exit 1
+  fi
+
+  case "$format" in
+    id) printf '%s\n' "$id" ;;
+    md) render_task_show "$db" "$id" ;;
+    prompt) render_task_prompt "$db" "$id" ;;
+  esac
+}
+
 cmd_note() {
   require_sqlite3
   [ "$#" -ge 2 ] || die "usage: cxq note <id> <note>"
@@ -665,44 +837,10 @@ cmd_prompt() {
   local id=$1
   require_task_id "$id"
 
-  local db title status acceptance verify
+  local db
   db=$(db_path_or_die)
   task_exists "$db" "$id" || die "task not found: $id"
-  title=$(sqlite_value "$db" "SELECT title FROM tasks WHERE id = $id;")
-  status=$(sqlite_value "$db" "SELECT status FROM tasks WHERE id = $id;")
-  acceptance=$(sqlite_value "$db" "SELECT acceptance FROM tasks WHERE id = $id;")
-  verify=$(sqlite_value "$db" "SELECT verify_command FROM tasks WHERE id = $id;")
-
-  printf 'You are working on local task #%s.\n\n' "$id"
-  printf 'Title:\n%s\n\n' "$title"
-  printf 'Status:\n%s\n\n' "$status"
-  printf 'Allowed paths:\n'
-  print_json_array_md "$db" "$id" "allowed_paths_json"
-  printf '\n'
-  printf 'Acceptance criteria:\n'
-  if [ -n "$acceptance" ]; then
-    printf '%s\n' "$acceptance"
-  else
-    printf 'None\n'
-  fi
-  printf '\n'
-  printf 'Verification command:\n'
-  if [ -n "$verify" ]; then
-    printf '%s\n' "$verify"
-  else
-    printf 'None\n'
-  fi
-  printf '\n'
-  cat <<EOF
-Instructions:
-- Work only on this task.
-- Respect allowed paths unless the implementation clearly requires more scope.
-- Use \`cxq note $id "..."\` for important discoveries.
-- Run the verification command when present.
-- When finished, move the task to review:
-  \`cxq review $id --summary "..."\`
-- Do not mark the task done.
-EOF
+  render_task_prompt "$db" "$id"
 }
 
 cmd_review() {
@@ -737,7 +875,7 @@ cmd_review() {
   db=$(db_path_or_die)
   task_exists "$db" "$id" || die "task not found: $id"
   actor=$(current_actor)
-  sqlite_exec "$db" "UPDATE tasks SET status = 'review', result_summary = $(sql_quote "$summary"), lease_until = NULL WHERE id = $id;"
+  sqlite_exec "$db" "UPDATE tasks SET status = 'review', result_summary = $(sql_quote "$summary"), claimed_by = NULL, claimed_at = NULL, lease_until = NULL WHERE id = $id;"
   log_event "$db" "$id" "review" "$actor" "$summary"
   printf 'Moved task #%s to review\n' "$id"
 }
@@ -772,7 +910,7 @@ cmd_done() {
   db=$(db_path_or_die)
   task_exists "$db" "$id" || die "task not found: $id"
   actor=$(current_actor)
-  sqlite_exec "$db" "UPDATE tasks SET status = 'done', result_summary = CASE WHEN $(sql_quote "$summary") = '' THEN result_summary ELSE $(sql_quote "$summary") END, lease_until = NULL WHERE id = $id;"
+  sqlite_exec "$db" "UPDATE tasks SET status = 'done', result_summary = CASE WHEN $(sql_quote "$summary") = '' THEN result_summary ELSE $(sql_quote "$summary") END, claimed_by = NULL, claimed_at = NULL, lease_until = NULL WHERE id = $id;"
   log_event "$db" "$id" "done" "$actor" "$summary"
   printf 'Marked task #%s done\n' "$id"
 }
@@ -839,9 +977,17 @@ main() {
       shift
       cmd_next "$@"
       ;;
+    show)
+      shift
+      cmd_show "$@"
+      ;;
     claim)
       shift
       cmd_claim "$@"
+      ;;
+    claim-next)
+      shift
+      cmd_claim_next "$@"
       ;;
     note)
       shift

@@ -92,6 +92,10 @@ cxq install
 from the root of a Git project, it creates the local queue files needed for that
 project.
 
+`cxq install` is non-destructive. If `.codex/tasks.schema.sql` or
+`.codex/prompts/task.md` already exists, it leaves the file unchanged and prints
+a message saying so.
+
 Expected project layout:
 
 ```text
@@ -139,7 +143,9 @@ cxq install
 cxq add "Fix flaky auth refresh test"
 cxq list
 cxq next
+cxq show 42
 cxq claim 42 --agent codex --lease 2h
+cxq claim-next --agent codex --lease 2h --format prompt
 cxq note 42 "Found race in token refresh path"
 cxq prompt 42
 cxq review 42 --summary "Implemented lock and added regression test"
@@ -179,14 +185,14 @@ cxq add "Refactor billing webhook verifier" \
 Then an agent can claim and work the task:
 
 ```sh
-cxq next
-cxq claim 42 --agent codex --lease 2h
-cxq prompt 42
+cxq claim-next --agent codex --lease 2h --format prompt
 ```
 
-`cxq prompt 42` should render a deterministic prompt with the task title,
-allowed paths, acceptance criteria, verification command, and finishing
-instructions.
+`cxq show 42` renders the current task fields and recent events.
+
+`cxq prompt 42` renders a deterministic agent prompt with the task body, tags,
+allowed paths, acceptance criteria, verification command, recent events, result
+summary when present, and finishing instructions.
 
 ## Task statuses
 
@@ -213,12 +219,8 @@ cxq claim 42 --agent codex --lease 2h
 If an agent crashes, the task should not be stuck forever. Expired claims can be
 shown as stale or made available again.
 
-Future commands may include:
-
-```sh
-cxq stale
-cxq release 42
-```
+Use `cxq stale` to list expired claims and `cxq release 42` to return a claimed
+task to `ready`.
 
 ## Agent contract
 
@@ -236,13 +238,12 @@ Use `cxq` to read and update tasks. Do not edit `.codex/tasks.db` directly.
 
 Before starting queued work:
 
-1. Run `cxq next --format md`.
-2. Claim exactly one task with `cxq claim <id> --agent codex`.
-3. Work only on the claimed task.
-4. Respect `allowed_paths` unless the task clearly requires more scope.
-5. Run the task's `verify_command` when present.
-6. Add notes with `cxq note <id> "..."`.
-7. End by moving the task to `review`, with:
+1. Claim exactly one task with `cxq claim-next --agent codex --lease 2h --format prompt`.
+2. Work only on the claimed task.
+3. Respect `allowed_paths` unless the task clearly requires more scope.
+4. Run the task's `verify_command` when present.
+5. Add notes with `cxq note <id> "..."`.
+6. End by moving the task to `review`, with:
    - files changed
    - tests run
    - remaining risks
