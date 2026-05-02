@@ -354,3 +354,27 @@ Before finishing, verify:
 - No customized files are silently overwritten.
 - No release is published unless explicitly requested.
 - Suggested commit message is provided.
+## Local task queue
+
+This repo uses a local Codex task queue.
+
+Use `cxq` to read and update tasks. Do not edit `.codex/tasks.db` directly.
+
+Before starting queued work:
+
+1. Claim exactly one task with `cxq claim-next --agent codex --lease 2h --format prompt`.
+2. Work only on the claimed task.
+3. Respect `allowed_paths` unless the task clearly requires more scope.
+4. Run the task's `verify_command` when present.
+5. Add notes with `cxq note <id> "..."`.
+6. End by moving the task to `review`, with:
+   - files changed
+   - tests run
+   - remaining risks
+   - suggested next step
+
+If `cxq` exits with update-required, run:
+`cxq update --all --yes`
+then retry the original command.
+
+Never mark a task `done` unless explicitly instructed.

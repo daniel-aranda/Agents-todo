@@ -1,0 +1,4 @@
+
+# cxq local queue
+.codex/tasks.db
+.codex/tasks.db-*
