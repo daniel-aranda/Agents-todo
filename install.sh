@@ -17,7 +17,7 @@ Environment:
   PREFIX=/path ./install.sh
 
 Default prefix:
-  First writable known macOS bin directory already on PATH, otherwise $HOME/.local
+  $HOME/.local
 EOF
 }
 
@@ -58,25 +58,22 @@ record_install_metadata() {
 }
 
 choose_prefix() {
-  local candidate bin
-
-  for candidate in /usr/local /opt/homebrew "$HOME/.local"; do
-    bin="$candidate/bin"
-    if [ -d "$bin" ] && [ -w "$bin" ] && path_contains "$bin"; then
-      printf '%s' "$candidate"
-      return
-    fi
-  done
-
-  for candidate in /usr/local /opt/homebrew; do
-    bin="$candidate/bin"
-    if [ -d "$bin" ] && [ -w "$bin" ]; then
-      printf '%s' "$candidate"
-      return
-    fi
-  done
-
   printf '%s' "$HOME/.local"
+}
+
+warn_old_binaries() {
+  local install_dir=$1
+  local dirs old
+  dirs=${CXQ_OLD_BIN_DIRS:-"/opt/homebrew/bin /usr/local/bin"}
+
+  if [ "$install_dir" = "$HOME/.local/bin" ]; then
+    for old in $dirs; do
+      if [ -x "$old/cxq" ] && [ "$old/cxq" != "$install_dir/cxq" ]; then
+        printf '\nWarning: found another cxq at %s\n' "$old/cxq"
+        printf 'If %s appears before %s in PATH, your shell may still run the older binary.\n' "$old" "$install_dir"
+      fi
+    done
+  fi
 }
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -115,8 +112,10 @@ install_dir="$prefix/bin"
 target="$install_dir/cxq"
 
 mkdir -p "$install_dir"
-cp "$source_cli" "$target"
-chmod 0755 "$target"
+tmp_target="$target.tmp.$$"
+cp "$source_cli" "$tmp_target"
+chmod 0755 "$tmp_target"
+mv "$tmp_target" "$target"
 record_install_metadata "$script_dir" "$target"
 
 printf 'Installed cxq to %s\n' "$target"
@@ -130,3 +129,5 @@ case ":$PATH:" in
     printf '  export PATH="%s:$PATH"\n' "$install_dir"
     ;;
 esac
+
+warn_old_binaries "$install_dir"

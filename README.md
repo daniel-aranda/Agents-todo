@@ -8,19 +8,19 @@ can coordinate implementation work without editing ad hoc TODO files.
 
 The intended flow is simple:
 
-```sh
+~~~sh
 git clone https://github.com/daniel-aranda/Agents-todo.git
 cd Agents-todo
 ./install.sh
-```
+~~~
 
 That installs a global `cxq` command on macOS. Then, inside any Git project:
 
-```sh
+~~~sh
 cxq -v
 cd /path/to/your/project
 cxq install
-```
+~~~
 
 `cxq install` initializes the queue for that project.
 
@@ -77,13 +77,13 @@ Markdown TODO lists are easy to edit but easy to corrupt. Raw SQL is powerful
 but too sharp as the day-to-day interface. `cxq` keeps SQLite as the source of
 truth and exposes safe, predictable commands for humans and agents.
 
-```text
+~~~text
 SQLite      = state
 cxq         = API
 AGENTS.md   = agent protocol
 Codex       = worker
 Git         = project boundary
-```
+~~~
 
 ## Current platform
 
@@ -100,9 +100,9 @@ to `$HOME/.local/bin` and prints the `PATH` update needed for your shell.
 
 You can choose a prefix explicitly:
 
-```sh
+~~~sh
 ./install.sh --prefix "$HOME/.local"
-```
+~~~
 
 ## Project-local queues
 
@@ -110,9 +110,9 @@ You can choose a prefix explicitly:
 
 When you run:
 
-```sh
+~~~sh
 cxq install
-```
+~~~
 
 from the root of a Git project, it creates the local queue files needed for that
 project.
@@ -123,7 +123,7 @@ a message saying so.
 
 Expected project layout:
 
-```text
+~~~text
 your-project/
   AGENTS.md
   .gitignore
@@ -132,14 +132,14 @@ your-project/
     tasks.schema.sql
     prompts/
       task.md
-```
+~~~
 
 The SQLite database is local state and should not be committed:
 
-```text
+~~~text
 .codex/tasks.db
 .codex/tasks.db-*
-```
+~~~
 
 The schema and prompt templates can be committed so the project documents how
 its queue works.
@@ -151,9 +151,9 @@ its queue works.
 If you run it anywhere else, it exits without changing files and prints a clear
 message:
 
-```text
+~~~text
 cxq install only runs at the root of a Git project.
-```
+~~~
 
 This protects random directories from getting `.codex` files and makes the
 project boundary explicit.
@@ -162,14 +162,16 @@ project boundary explicit.
 
 The current version of `cxq` is intentionally small:
 
-```sh
+~~~sh
 cxq -v
+cxq version --plain
 cxq install
+cxq update
 cxq update --status
 cxq update --check
-cxq update --self --yes
-cxq update --repo --yes
-cxq update --all --yes
+cxq version bump patch
+cxq version set 0.2.1
+cxq release prepare 0.2.1
 cxq add "Fix flaky auth refresh test"
 cxq list
 cxq next
@@ -186,13 +188,13 @@ cxq done 42
 cxq repo 42
 cxq stale
 cxq release 42
-```
+~~~
 
 The default workflow is:
 
-```text
+~~~text
 inbox -> ready -> claimed -> review -> done
-```
+~~~
 
 Agents should normally stop at `review`. A human decides when a task is truly
 `done`.
@@ -202,7 +204,7 @@ them.
 
 ## Example task
 
-```sh
+~~~sh
 cxq add "Refactor billing webhook verifier" \
   --priority 70 \
   --tag security \
@@ -213,13 +215,13 @@ cxq add "Refactor billing webhook verifier" \
 - run pnpm test billing
 " \
   --verify "pnpm test billing"
-```
+~~~
 
 Then an agent can claim and work the task:
 
-```sh
+~~~sh
 cxq claim-next --agent codex --lease 2h --format prompt
-```
+~~~
 
 `cxq show 42` renders the current task fields and recent events.
 
@@ -231,11 +233,11 @@ summary when present, and finishing instructions.
 
 Tasks can be blocked by other tasks:
 
-```sh
+~~~sh
 cxq block 42 --by 17
 cxq deps 42
 cxq unblock 42 --by 17
-```
+~~~
 
 `cxq claim-next` and `cxq next` skip tasks with blockers that are not `done`.
 Once every blocker is `done`, the dependent task becomes claimable again while
@@ -259,9 +261,9 @@ preserving normal priority ordering. Self-dependencies and cycles are rejected.
 
 Claims should have leases:
 
-```sh
+~~~sh
 cxq claim 42 --agent codex --lease 2h
-```
+~~~
 
 If an agent crashes, the task should not be stuck forever. Expired claims can be
 shown as stale or made available again.
@@ -281,13 +283,19 @@ the update is handled.
 
 Useful commands:
 
-```sh
+~~~sh
+cxq update
 cxq update --status
 cxq update --check
-cxq update --self --yes
-cxq update --repo --yes
-cxq update --all --yes
-```
+cxq update --self
+cxq update --repo
+cxq update --all
+~~~
+
+`cxq update` is the normal path: it checks remote tags, updates `cxq` when a
+newer stable version exists, reapplies safe repo setup when needed, and prints a
+short status. Non-interactive updates that would modify files require
+`--yes`.
 
 `cxq update --self` only auto-updates when `install.sh` recorded a Git checkout
 as the install source. It fetches tags, pulls with `--ff-only`, and reruns that
@@ -296,13 +304,42 @@ without overwriting customized schema, prompt, or `AGENTS.md` files.
 
 Escape hatches:
 
-```sh
+~~~sh
 CXQ_NO_UPDATE_CHECK=1 cxq list
 CXQ_ASSUME_YES=1 cxq claim-next --format prompt
-```
+~~~
 
 `CXQ_NO_UPDATE_CHECK=1` skips the gate. `CXQ_ASSUME_YES=1` lets `cxq` attempt
-`cxq update --all --yes` automatically when an update is required.
+`cxq update --yes` automatically when an update is required.
+
+## Version And Release
+
+Version and release commands are for this `cxq` source repo, not arbitrary user
+projects.
+
+~~~sh
+cxq version --plain
+cxq version bump patch
+cxq version bump minor
+cxq version bump major
+cxq version set 0.2.1
+~~~
+
+Release preparation is explicit and local-first:
+
+~~~sh
+cxq release prepare 0.2.1
+cxq release tag 0.2.1
+cxq release publish 0.2.1
+cxq release 0.2.1
+~~~
+
+`cxq release prepare` verifies the requested version and writes release notes to
+`/tmp/cxq-release-vX.Y.Z.md`. `cxq release tag` creates and pushes the Git tag.
+`cxq release publish` requires `gh` and publishes the GitHub release. The full
+`cxq release X.Y.Z` path asks before publishing interactively and requires
+`--yes` when non-interactive. Use `--dry-run` to print actions without changing
+Git or GitHub.
 
 ## Agent contract
 
@@ -311,7 +348,7 @@ to use the queue.
 
 Recommended contract:
 
-```md
+~~~md
 ## Local task queue
 
 This repo uses a local Codex task queue.
@@ -332,11 +369,11 @@ Before starting queued work:
    - suggested next step
 
 If `cxq` exits with update-required, run:
-`cxq update --all --yes`
+`cxq update --yes`
 then retry the original command.
 
 Never mark a task `done` unless explicitly instructed.
-```
+~~~
 
 ## SQLite schema shape
 
@@ -394,9 +431,9 @@ protocol.
 
 Run the dependency-free test suite:
 
-```sh
+~~~sh
 make test
-```
+~~~
 
 The tests install `cxq` into a temporary prefix, verify `cxq -v`, create
 temporary Git repositories, run `cxq install`, and exercise the task lifecycle.

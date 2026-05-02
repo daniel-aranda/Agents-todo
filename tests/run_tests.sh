@@ -8,10 +8,19 @@ PREFIX="$TEST_DIR/prefix"
 CXQ="$PREFIX/bin/cxq"
 PASS=0
 export HOME="$TEST_DIR/home"
-export CXQ_TEST_LATEST_VERSION="v0.2.0"
 export CXQ_NOW_EPOCH="1000000"
 
 mkdir -p "$HOME"
+
+current_repo_version() {
+  local line
+  line=$(grep -E '^CXQ_VERSION="' "$ROOT/bin/cxq" | head -n 1)
+  line=${line#CXQ_VERSION=\"}
+  line=${line%\"}
+  printf '%s' "$line"
+}
+
+export CXQ_TEST_LATEST_VERSION="v$(current_repo_version)"
 
 cleanup() {
   rm -rf "$TEST_DIR"
@@ -67,6 +76,31 @@ run_git_init() {
   git -C "$1" config user.name "cxq test"
 }
 
+run_source_fixture() {
+  local repo=$1
+  mkdir -p "$repo/bin" "$repo/tests"
+  cp "$ROOT/bin/cxq" "$repo/bin/cxq"
+  cp "$ROOT/install.sh" "$repo/install.sh"
+  cp "$ROOT/tests/run_tests.sh" "$repo/tests/run_tests.sh"
+  cp "$ROOT/README.md" "$repo/README.md"
+  chmod +x "$repo/bin/cxq" "$repo/install.sh" "$repo/tests/run_tests.sh"
+  git init -q "$repo"
+  git -C "$repo" checkout -q -B main
+  git -C "$repo" config user.email test@example.com
+  git -C "$repo" config user.name "cxq test"
+  git -C "$repo" add .
+  git -C "$repo" commit -q -m "fixture"
+}
+
+fixture_version() {
+  local repo=$1
+  local line
+  line=$(grep -E '^CXQ_VERSION="' "$repo/bin/cxq" | head -n 1)
+  line=${line#CXQ_VERSION=\"}
+  line=${line%\"}
+  printf '%s' "$line"
+}
+
 state_db() {
   printf '%s/.cxq/state.db' "$HOME"
 }
@@ -80,16 +114,50 @@ state_set() {
   sqlite3 -batch "$(state_db)" "CREATE TABLE IF NOT EXISTS cxq_state (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT OR REPLACE INTO cxq_state (key, value) VALUES ('$1', '$2');"
 }
 
+assert_cxq_version() {
+  local expected=$1
+  local output plain
+  output=$("$CXQ" version)
+  plain=$("$CXQ" version --plain)
+  assert_contains "$output" "cxq $expected"
+  [ "$plain" = "$expected" ] || fail "expected plain version $expected, got $plain"
+}
+
 test_installer_and_version() {
   PREFIX="$PREFIX" "$ROOT/install.sh" >/tmp/cxq-install-test.out
   assert_file "$CXQ"
   assert_file "$HOME/.cxq/state.db"
   [ "$(state_get "install_bin_path")" = "$CXQ" ] || fail "installer should record install_bin_path"
   [ "$(state_get "install_source_dir")" = "$ROOT" ] || fail "installer should record install_source_dir"
-  local output
-  output=$("$CXQ" -v)
-  assert_contains "$output" "cxq 0.2.0" "cxq -v prints version"
+  assert_cxq_version "$(current_repo_version)"
   pass "installer creates a working cxq command"
+}
+
+test_installer_defaults_to_home_local() {
+  local output default_cxq
+  rm -rf "$HOME/.local"
+  output=$("$ROOT/install.sh")
+  default_cxq="$HOME/.local/bin/cxq"
+  assert_file "$default_cxq"
+  assert_contains "$output" "Installed cxq to $default_cxq"
+  assert_contains "$output" "$HOME/.local/bin is not currently in PATH"
+  pass "installer defaults to HOME/.local"
+}
+
+test_installer_explicit_prefix_and_old_binary_warning() {
+  local explicit old output
+  explicit="$TEST_DIR/opt-homebrew"
+  PREFIX="$explicit" "$ROOT/install.sh" >/dev/null
+  assert_file "$explicit/bin/cxq"
+
+  old="$TEST_DIR/old-homebrew/bin"
+  mkdir -p "$old"
+  printf '#!/usr/bin/env bash\nprintf old\\n\n' >"$old/cxq"
+  chmod +x "$old/cxq"
+  rm -rf "$HOME/.local"
+  output=$(CXQ_OLD_BIN_DIRS="$old" "$ROOT/install.sh")
+  assert_contains "$output" "Warning: found another cxq at $old/cxq"
+  pass "installer supports explicit prefix and warns about old PATH binaries"
 }
 
 test_install_rejects_non_git_directory() {
@@ -468,7 +536,7 @@ test_update_status_creates_state_db() {
   rm -rf "$HOME/.cxq"
   output=$("$CXQ" update --status)
   assert_file "$HOME/.cxq/state.db"
-  assert_contains "$output" "current_version: 0.2.0"
+  assert_contains "$output" "current_version: $(current_repo_version)"
   assert_contains "$output" "update_required: 0"
   pass "update status creates and reports global state"
 }
@@ -496,7 +564,7 @@ test_update_check_runs_after_24h() {
   state_set "last_update_check_at" "1000"
   state_set "last_update_check_result" "old-result"
 
-  (cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION=v0.2.0 "$CXQ" list >/dev/null)
+  (cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION="v$(current_repo_version)" "$CXQ" list >/dev/null)
   result=$(state_get "last_update_check_result")
   checked_at=$(state_get "last_update_check_at")
   assert_contains "$result" "up-to-date"
@@ -510,11 +578,11 @@ test_latest_version_marks_update_required() {
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
 
-  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v0.2.1 "$CXQ" update --check)
-  assert_contains "$output" "update-available: v0.2.1"
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v99.0.0 "$CXQ" update --check)
+  assert_contains "$output" "update-available: v99.0.0"
   [ "$(state_get "update_required")" = "1" ] || fail "newer latest version should mark update required"
   [ "$(state_get "update_required_kind")" = "self" ] || fail "newer latest version should require self update"
-  [ "$(state_get "latest_version")" = "v0.2.1" ] || fail "latest version should be recorded"
+  [ "$(state_get "latest_version")" = "v99.0.0" ] || fail "latest version should be recorded"
   pass "newer latest version marks self update required"
 }
 
@@ -626,10 +694,94 @@ test_update_check_command() {
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
 
-  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v0.2.0 "$CXQ" update --check)
-  assert_contains "$output" "up-to-date: v0.2.0"
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION="v$(current_repo_version)" "$CXQ" update --check)
+  assert_contains "$output" "up-to-date: v$(current_repo_version)"
   assert_contains "$output" "No update required."
   pass "update --check records remote check result"
+}
+
+test_plain_update_current() {
+  local repo output
+  repo="$TEST_DIR/update-plain-current"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION="v$(current_repo_version)" "$CXQ" update)
+  assert_contains "$output" "cxq is up to date: $(current_repo_version)"
+  pass "plain cxq update is the current-version happy path"
+}
+
+test_plain_update_requires_yes_when_modifying_noninteractive() {
+  local repo output status
+  repo="$TEST_DIR/update-plain-needs-yes"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  rm "$repo/.codex/prompts/task.md"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" update 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "plain non-interactive update should require --yes before modifying files"
+  assert_contains "$output" "Run: cxq update --yes"
+  assert_not_exists "$repo/.codex/prompts/task.md"
+  pass "plain non-interactive update requires --yes when modifying files"
+}
+
+test_plain_update_yes_repairs_repo_and_clears_state() {
+  local repo output
+  repo="$TEST_DIR/update-plain-yes"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  rm "$repo/.codex/prompts/task.md"
+
+  output=$(cd "$repo" && "$CXQ" update --yes)
+  assert_contains "$output" "Created: .codex/prompts/task.md"
+  assert_contains "$output" "Repo setup is up to date."
+  assert_file "$repo/.codex/prompts/task.md"
+  [ "$(state_get "update_required")" = "0" ] || fail "plain update --yes should clear update_required"
+  pass "plain update --yes repairs repo setup and clears state"
+}
+
+test_update_aliases() {
+  local repo output
+  repo="$TEST_DIR/update-aliases"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  output=$(cd "$repo" && "$CXQ" --status)
+  assert_contains "$output" "current_version: $(current_repo_version)"
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION="v$(current_repo_version)" "$CXQ" --check)
+  assert_contains "$output" "No update required."
+  pass "top-level update aliases work"
+}
+
+test_update_self_clears_state_without_shell_error() {
+  local repo source target_prefix output status
+  repo="$TEST_DIR/update-self-state"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  source="$TEST_DIR/self-source"
+  run_source_fixture "$source"
+  target_prefix="$TEST_DIR/self-install"
+  state_set "install_source_dir" "$source"
+  state_set "install_bin_path" "$target_prefix/bin/cxq"
+  state_set "update_required" "1"
+  state_set "update_required_kind" "self"
+  state_set "update_required_reason" "test self update"
+  state_set "latest_version" "v$(current_repo_version)"
+
+  set +e
+  output=$(cd "$repo" && CXQ_TEST_SKIP_SELF_UPDATE_GIT=1 "$CXQ" update --yes 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || fail "self update should succeed. Output: $output"
+  assert_file "$target_prefix/bin/cxq"
+  assert_contains "$output" "cxq is now up to date: v$(current_repo_version)"
+  assert_not_contains "$output" "command not found"
+  [ "$(state_get "update_required")" = "0" ] || fail "self update should clear update_required"
+  [ -z "$(state_get "update_required_kind")" ] || fail "self update should clear update_required_kind"
+  pass "self update clears state without shell errors"
 }
 
 test_prerelease_update_tags_are_ignored() {
@@ -697,6 +849,127 @@ test_repeated_update_gate_does_not_loop() {
   pass "repeated update gate fails instead of looping"
 }
 
+test_version_bump_and_set_commands() {
+  local repo base output
+  repo="$TEST_DIR/version-bump"
+  run_source_fixture "$repo"
+  base=$(fixture_version "$repo")
+
+  output=$(cd "$repo" && "$CXQ" version bump patch)
+  assert_contains "$output" "Updated cxq version: $base ->"
+  [ "$(fixture_version "$repo")" = "$(bump_patch_expected "$base")" ] || fail "patch bump did not update fixture version"
+
+  (cd "$repo" && "$CXQ" version set "$base" >/dev/null)
+  output=$(cd "$repo" && "$CXQ" version bump minor)
+  assert_contains "$output" "Updated cxq version: $base ->"
+  (cd "$repo" && "$CXQ" version set "$base" >/dev/null)
+  output=$(cd "$repo" && "$CXQ" version bump major)
+  assert_contains "$output" "Updated cxq version: $base ->"
+  output=$(cd "$repo" && "$CXQ" version set 1.2.3)
+  assert_contains "$output" "Updated cxq version:"
+  [ "$(fixture_version "$repo")" = "1.2.3" ] || fail "version set did not update fixture version"
+  pass "version bump and set commands update canonical version"
+}
+
+bump_patch_expected() {
+  local version=$1 major minor patch
+  version=${version%-dev}
+  IFS=. read -r major minor patch <<<"$version"
+  printf '%s.%s.%s' "$major" "$minor" "$((10#$patch + 1))"
+}
+
+test_version_invalid_and_outside_repo() {
+  local repo output status outside
+  repo="$TEST_DIR/version-invalid"
+  run_source_fixture "$repo"
+  set +e
+  output=$(cd "$repo" && "$CXQ" version set nope 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "invalid version should fail"
+  assert_contains "$output" "version must be stable SemVer"
+
+  outside="$TEST_DIR/not-source"
+  run_git_init "$outside"
+  set +e
+  output=$(cd "$outside" && "$CXQ" version bump patch 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "version bump outside source repo should fail"
+  assert_contains "$output" "cxq source repo"
+  pass "version commands validate input and source repo"
+}
+
+test_release_prepare_and_dry_runs() {
+  local repo version notes output status
+  repo="$TEST_DIR/release-prepare"
+  run_source_fixture "$repo"
+  version=$(fixture_version "$repo")
+  notes="/tmp/cxq-release-v$version.md"
+  rm -f "$notes"
+
+  output=$(cd "$repo" && "$CXQ" release prepare "$version" --skip-tests)
+  assert_contains "$output" "Prepared release notes:"
+  assert_file "$notes"
+  grep -q '~~~sh' "$notes" || fail "release notes should use tildes fences"
+  ! grep -q '```' "$notes" || fail "release notes should not use triple backtick fences"
+
+  output=$(cd "$repo" && "$CXQ" release tag "$version" --dry-run --skip-tests)
+  assert_contains "$output" "Dry run: would create and push tag v$version."
+  ! git -C "$repo" rev-parse -q --verify "refs/tags/v$version" >/dev/null || fail "dry-run tag should not create tag"
+
+  output=$(cd "$repo" && "$CXQ" release "$version" --dry-run)
+  assert_contains "$output" "Dry run: would prepare, tag, and publish cxq v$version."
+  pass "release prepare and dry-run commands work"
+}
+
+test_release_prepare_rejects_mismatch_and_existing_tag() {
+  local repo version output status
+  repo="$TEST_DIR/release-reject"
+  run_source_fixture "$repo"
+  version=$(fixture_version "$repo")
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" release prepare 9.9.9 --skip-tests 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "release prepare should reject version mismatch"
+  assert_contains "$output" "CXQ_VERSION does not match"
+
+  git -C "$repo" tag "v$version"
+  set +e
+  output=$(cd "$repo" && "$CXQ" release prepare "$version" --skip-tests 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "release prepare should reject existing tag"
+  assert_contains "$output" "already exists locally"
+  pass "release prepare rejects mismatch and existing tags"
+}
+
+test_release_publish_requires_yes_noninteractive_and_source_repo() {
+  local repo version output status outside
+  repo="$TEST_DIR/release-publish"
+  run_source_fixture "$repo"
+  version=$(fixture_version "$repo")
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" release publish "$version" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "non-interactive publish should require --yes"
+  assert_contains "$output" "requires --yes"
+
+  outside="$TEST_DIR/release-outside"
+  run_git_init "$outside"
+  set +e
+  output=$(cd "$outside" && "$CXQ" release prepare "$version" --skip-tests 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "release outside source repo should fail"
+  assert_contains "$output" "cxq source repo"
+  pass "release publish requires yes and release commands require source repo"
+}
+
 test_commands_work_from_repo_subdirectory_after_install() {
   local repo output
   repo="$TEST_DIR/subdir-use"
@@ -711,6 +984,8 @@ test_commands_work_from_repo_subdirectory_after_install() {
 }
 
 test_installer_and_version
+test_installer_defaults_to_home_local
+test_installer_explicit_prefix_and_old_binary_warning
 test_install_rejects_non_git_directory
 test_install_rejects_git_subdirectory
 test_project_install_creates_files
@@ -739,10 +1014,20 @@ test_noninteractive_update_gate_exits_90
 test_no_update_check_bypasses_gate
 test_assume_yes_attempts_update
 test_update_check_command
+test_plain_update_current
+test_plain_update_requires_yes_when_modifying_noninteractive
+test_plain_update_yes_repairs_repo_and_clears_state
+test_update_aliases
+test_update_self_clears_state_without_shell_error
 test_prerelease_update_tags_are_ignored
 test_update_all_yes_repairs_repo_setup
 test_failed_remote_check_does_not_block
 test_repeated_update_gate_does_not_loop
+test_version_bump_and_set_commands
+test_version_invalid_and_outside_repo
+test_release_prepare_and_dry_runs
+test_release_prepare_rejects_mismatch_and_existing_tag
+test_release_publish_requires_yes_noninteractive_and_source_repo
 test_commands_work_from_repo_subdirectory_after_install
 
 printf '\n%s tests passed\n' "$PASS"

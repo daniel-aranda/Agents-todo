@@ -16,9 +16,15 @@ cxq - local Codex task queue
 
 Usage:
   cxq -v | --version
+  cxq version [--plain]
+  cxq version bump patch|minor|major
+  cxq version set X.Y.Z
   cxq help
   cxq install
+  cxq update [--yes]
   cxq update --status|--check|--self|--repo|--all [--yes]
+  cxq release prepare|tag|publish X.Y.Z
+  cxq release X.Y.Z [--yes|--dry-run]
   cxq add <title> [options]
   cxq list [--all] [--status <status>]
   cxq next [--format text|id|md]
@@ -58,6 +64,28 @@ EOF
 
 version() {
   printf 'cxq %s\n' "$CXQ_VERSION"
+}
+
+cmd_version() {
+  case "${1:-}" in
+    "" )
+      version
+      ;;
+    --plain)
+      printf '%s\n' "$CXQ_VERSION"
+      ;;
+    bump)
+      shift
+      cmd_version_bump "$@"
+      ;;
+    set)
+      shift
+      cmd_version_set "$@"
+      ;;
+    *)
+      die "unknown version option: $1"
+      ;;
+  esac
 }
 
 require_macos() {
@@ -298,7 +326,7 @@ Before starting queued work:
    - suggested next step
 
 If `cxq` exits with update-required, run:
-`cxq update --all --yes`
+`cxq update --yes`
 then retry the original command.
 
 Tasks may depend on other tasks. Use `cxq deps <id>` to inspect blockers and
@@ -422,6 +450,77 @@ semver_gt() {
   if [ "$((10#$l_minor))" -gt "$((10#$r_minor))" ]; then return 0; fi
   if [ "$((10#$l_minor))" -lt "$((10#$r_minor))" ]; then return 1; fi
   [ "$((10#$l_patch))" -gt "$((10#$r_patch))" ]
+}
+
+valid_project_version() {
+  [[ "${1:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-dev)?$ ]]
+}
+
+valid_stable_version() {
+  [[ "${1:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+source_repo_root_or_die() {
+  local root
+  root=$(git_root) || die "version and release commands must run inside the cxq source repo."
+  root=$(physical_path "$root")
+  [ -f "$root/bin/cxq" ] &&
+    [ -f "$root/install.sh" ] &&
+    [ -f "$root/tests/run_tests.sh" ] &&
+    [ -f "$root/README.md" ] ||
+    die "this command must run inside the cxq source repo."
+  printf '%s' "$root"
+}
+
+repo_cxq_version() {
+  local root=$1
+  local line
+  line=$(grep -E '^CXQ_VERSION="' "$root/bin/cxq" | head -n 1)
+  line=${line#CXQ_VERSION=\"}
+  line=${line%\"}
+  printf '%s' "$line"
+}
+
+write_cxq_version() {
+  local root=$1
+  local new_version=$2
+  local src="$root/bin/cxq"
+  local tmp="$root/bin/cxq.tmp.$$"
+  local changed=0 line
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      CXQ_VERSION=\"*\")
+        printf 'CXQ_VERSION="%s"\n' "$new_version" >>"$tmp"
+        changed=1
+        ;;
+      *)
+        printf '%s\n' "$line" >>"$tmp"
+        ;;
+    esac
+  done <"$src"
+
+  [ "$changed" -eq 1 ] || {
+    rm -f "$tmp"
+    die "CXQ_VERSION not found in bin/cxq."
+  }
+  chmod 0755 "$tmp"
+  mv "$tmp" "$src"
+}
+
+bump_version_value() {
+  local version=$1
+  local part=$2
+  local base major minor patch
+  base=${version%-dev}
+  IFS=. read -r major minor patch <<<"$base"
+  case "$part" in
+    patch) patch=$((10#$patch + 1)) ;;
+    minor) minor=$((10#$minor + 1)); patch=0 ;;
+    major) major=$((10#$major + 1)); minor=0; patch=0 ;;
+    *) die "version bump must be patch, minor, or major." ;;
+  esac
+  printf '%s.%s.%s\n' "$major" "$minor" "$patch"
 }
 
 highest_stable_version_from_lsremote() {
@@ -1375,7 +1474,7 @@ cmd_stale() {
   sqlite3 -batch -header -column "$db" "SELECT id, status, priority, title, claimed_by, lease_until FROM tasks WHERE status = 'claimed' AND lease_until IS NOT NULL AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ORDER BY lease_until ASC;"
 }
 
-cmd_release() {
+cmd_task_release() {
   require_sqlite3
   [ "$#" -eq 1 ] || die "usage: cxq release <id>"
 
@@ -1390,6 +1489,254 @@ cmd_release() {
   actor=$(current_actor)
   log_event "$db" "$id" "released" "$actor" ""
   printf 'Released task #%s\n' "$id"
+}
+
+cmd_version_set() {
+  [ "$#" -eq 1 ] || die "usage: cxq version set X.Y.Z"
+  local new_version=$1
+  valid_project_version "$new_version" || die "version must be stable SemVer X.Y.Z or X.Y.Z-dev."
+
+  local root old_version
+  root=$(source_repo_root_or_die)
+  old_version=$(repo_cxq_version "$root")
+  write_cxq_version "$root" "$new_version"
+
+  printf 'Updated cxq version: %s -> %s\n' "$old_version" "$new_version"
+  printf 'Changed:\n'
+  printf '%s\n\n' '- bin/cxq'
+  printf 'Next:\n'
+  printf '  git add bin/cxq README.md tests/run_tests.sh\n'
+  printf '  git commit -m "chore: bump cxq to %s"\n' "$new_version"
+}
+
+cmd_version_bump() {
+  [ "$#" -eq 1 ] || die "usage: cxq version bump patch|minor|major"
+  local part=$1
+  local root old_version new_version
+  root=$(source_repo_root_or_die)
+  old_version=$(repo_cxq_version "$root")
+  valid_project_version "$old_version" || die "current CXQ_VERSION is not a supported project version: $old_version"
+  new_version=$(bump_version_value "$old_version" "$part")
+  cmd_version_set "$new_version"
+}
+
+release_notes_path() {
+  local version=$1
+  printf '/tmp/cxq-release-v%s.md' "$version"
+}
+
+tag_exists_local() {
+  git rev-parse -q --verify "refs/tags/v$1" >/dev/null
+}
+
+tag_exists_remote() {
+  local version=$1
+  local output
+  output=$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs origin "v$version" 2>/dev/null || true)
+  [ -n "$output" ]
+}
+
+release_verify_version() {
+  local root=$1
+  local version=$2
+  valid_stable_version "$version" || die "release version must be stable SemVer X.Y.Z."
+  [ "$(repo_cxq_version "$root")" = "$version" ] || die "CXQ_VERSION does not match requested release version $version."
+}
+
+release_warn_dirty() {
+  if [ -n "$(git status --porcelain)" ]; then
+    printf 'Warning: working tree has uncommitted changes.\n' >&2
+  fi
+}
+
+release_check_tag_available() {
+  local version=$1
+  if tag_exists_local "$version"; then
+    die "tag v$version already exists locally."
+  fi
+  if tag_exists_remote "$version"; then
+    die "tag v$version already exists on origin."
+  fi
+}
+
+release_run_tests() {
+  local skip_tests=$1
+  if [ "$skip_tests" -eq 1 ]; then
+    printf 'Skipping tests.\n'
+    return
+  fi
+  bash -n bin/cxq install.sh tests/run_tests.sh
+  make test
+}
+
+release_prepare_notes() {
+  local version=$1
+  local notes
+  notes=$(release_notes_path "$version")
+  cat >"$notes" <<EOF
+## cxq v$version
+
+Release summary.
+
+### Update
+
+~~~sh
+git pull --ff-only origin main
+./install.sh
+cxq version
+cxq update --status
+~~~
+
+### Notes
+
+- Add notes here before publishing.
+EOF
+  printf '%s' "$notes"
+}
+
+cmd_release_prepare() {
+  local version=$1
+  local skip_tests=${2:-0}
+  local root notes
+  root=$(source_repo_root_or_die)
+  release_verify_version "$root" "$version"
+  release_warn_dirty
+  release_check_tag_available "$version"
+  release_run_tests "$skip_tests"
+  notes=$(release_prepare_notes "$version")
+  printf 'Prepared release notes:\n'
+  printf '  %s\n\n' "$notes"
+  printf 'Next:\n'
+  printf '  cxq release tag %s\n' "$version"
+  printf '  cxq release publish %s\n' "$version"
+}
+
+cmd_release_tag() {
+  local version=$1
+  local skip_tests=${2:-0}
+  local dry_run=${3:-0}
+  local root branch
+  root=$(source_repo_root_or_die)
+  release_verify_version "$root" "$version"
+  branch=$(git branch --show-current)
+  [ "$branch" = "main" ] || die "release tags must be created from main."
+  release_check_tag_available "$version"
+  release_run_tests "$skip_tests"
+
+  if [ "$dry_run" -eq 1 ]; then
+    printf 'Dry run: would create and push tag v%s.\n' "$version"
+    return
+  fi
+
+  git tag -a "v$version" -m "cxq v$version"
+  git push origin "v$version"
+  printf 'Tagged and pushed v%s.\n' "$version"
+  printf 'Next:\n'
+  printf '  cxq release publish %s\n' "$version"
+}
+
+cmd_release_publish() {
+  local version=$1
+  local yes=${2:-0}
+  local dry_run=${3:-0}
+  local root notes
+  root=$(source_repo_root_or_die)
+  release_verify_version "$root" "$version"
+  notes=$(release_notes_path "$version")
+
+  if [ "$dry_run" -eq 1 ]; then
+    printf 'Dry run: would publish GitHub release v%s.\n' "$version"
+    return
+  fi
+
+  if [ "$yes" -ne 1 ] && ! gate_is_interactive; then
+    die "non-interactive release publish requires --yes."
+  fi
+  command -v gh >/dev/null 2>&1 || die "gh is required to publish releases."
+  git rev-parse -q --verify "refs/tags/v$version" >/dev/null || die "tag v$version does not exist locally."
+  if [ ! -f "$notes" ]; then
+    notes=$(release_prepare_notes "$version")
+  fi
+  gh release create "v$version" \
+    --repo daniel-aranda/Agents-todo \
+    --title "cxq v$version" \
+    --notes-file "$notes" \
+    --verify-tag \
+    --latest
+}
+
+cmd_release_workflow() {
+  local version=$1
+  local yes=${2:-0}
+  local skip_tests=${3:-0}
+  local dry_run=${4:-0}
+
+  if [ "$dry_run" -eq 1 ]; then
+    source_repo_root_or_die >/dev/null
+    release_verify_version "$(source_repo_root_or_die)" "$version"
+    printf 'Dry run: would prepare, tag, and publish cxq v%s.\n' "$version"
+    return
+  fi
+
+  cmd_release_prepare "$version" "$skip_tests"
+  cmd_release_tag "$version" 1 0
+  if [ "$yes" -ne 1 ] && gate_is_interactive; then
+    local answer
+    printf 'Publish GitHub release now? [y/N] ' >&2
+    answer=$(gate_read_answer)
+    printf '\n' >&2
+    case "$answer" in
+      y|Y|yes|YES|Yes) ;;
+      *) printf 'Release tag created. Publish later with: cxq release publish %s\n' "$version"; return 0 ;;
+    esac
+  elif [ "$yes" -ne 1 ]; then
+    die "non-interactive full release requires --yes before publishing."
+  fi
+  cmd_release_publish "$version" 1 0
+}
+
+cmd_release() {
+  if [ "$#" -eq 1 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+    cmd_task_release "$@"
+    return
+  fi
+
+  local action=${1:-}
+  local version="" yes=0 skip_tests=0 dry_run=0
+  case "$action" in
+    prepare|tag|publish)
+      shift
+      version=${1:-}
+      [ -n "$version" ] || die "release version is required."
+      shift
+      ;;
+    "")
+      die "usage: cxq release <id>|prepare|tag|publish X.Y.Z"
+      ;;
+    *)
+      version=$action
+      shift
+      action="all"
+      ;;
+  esac
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      --skip-tests) skip_tests=1; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      *) die "unknown release option: $1" ;;
+    esac
+  done
+
+  valid_stable_version "$version" || die "release version must be stable SemVer X.Y.Z."
+  case "$action" in
+    prepare) cmd_release_prepare "$version" "$skip_tests" ;;
+    tag) cmd_release_tag "$version" "$skip_tests" "$dry_run" ;;
+    publish) cmd_release_publish "$version" "$yes" "$dry_run" ;;
+    all) cmd_release_workflow "$version" "$yes" "$skip_tests" "$dry_run" ;;
+    *) die "unknown release action: $action" ;;
+  esac
 }
 
 print_update_status() {
@@ -1429,10 +1776,34 @@ cmd_update_check() {
   fi
 }
 
+update_confirm_modify() {
+  local what=$1
+  local yes=$2
+
+  if [ "$yes" -eq 1 ]; then
+    return 0
+  fi
+  if gate_is_interactive; then
+    local answer
+    printf '%s [Y/n] ' "$what" >&2
+    answer=$(gate_read_answer)
+    printf '\n' >&2
+    case "$answer" in
+      ""|y|Y|yes|YES|Yes) return 0 ;;
+      *) printf 'Update cancelled.\n' >&2; return 1 ;;
+    esac
+  fi
+  printf '%s\n' "$what" >&2
+  printf 'Run: cxq update --yes\n' >&2
+  return 1
+}
+
 cmd_update_self() {
-  local source_dir bin_path prefix
+  local yes=${1:-0}
+  local source_dir bin_path prefix latest
   source_dir=$(state_get "install_source_dir")
   bin_path=$(state_get "install_bin_path")
+  latest=$(state_get "latest_version")
 
   if [ -z "$source_dir" ] || [ ! -d "$source_dir/.git" ] || [ ! -f "$source_dir/install.sh" ]; then
     printf 'cxq self-update cannot run automatically from this install.\n' >&2
@@ -1440,8 +1811,12 @@ cmd_update_self() {
     return 1
   fi
 
-  GIT_TERMINAL_PROMPT=0 git -C "$source_dir" fetch --tags --quiet
-  GIT_TERMINAL_PROMPT=0 git -C "$source_dir" pull --ff-only
+  update_confirm_modify "Update cxq now?" "$yes" || return 1
+  printf 'Updating cxq...\n'
+  if [ "${CXQ_TEST_SKIP_SELF_UPDATE_GIT:-}" != "1" ]; then
+    GIT_TERMINAL_PROMPT=0 git -C "$source_dir" fetch --tags --quiet
+    GIT_TERMINAL_PROMPT=0 git -C "$source_dir" pull --ff-only
+  fi
 
   if [ -n "$bin_path" ]; then
     prefix=$(dirname "$(dirname "$bin_path")")
@@ -1450,12 +1825,24 @@ cmd_update_self() {
     "$source_dir/install.sh"
   fi
 
-  clear_update_required_if_kind "self"
+  state_set "update_required" "0"
+  state_set "update_required_kind" ""
+  state_set "update_required_reason" ""
+  state_set "update_required_since" ""
+  printf 'cxq is now up to date: %s\n' "${latest:-${CXQ_VERSION}}"
 }
 
 cmd_update_repo() {
+  local yes=${1:-0}
   local root reason
   root=$(project_root_or_die)
+  reason=$(repo_update_reason "$root" || true)
+  if [ -z "$reason" ]; then
+    printf 'Repo setup is up to date.\n'
+    clear_update_required_if_kind "repo"
+    return 0
+  fi
+  update_confirm_modify "Update repo setup now?" "$yes" || return 1
   setup_project_queue "$root"
   reason=$(repo_update_reason "$root" || true)
   if [ -n "$reason" ]; then
@@ -1464,29 +1851,34 @@ cmd_update_repo() {
     return 1
   fi
   clear_update_required_if_kind "repo"
+  printf 'Repo setup is up to date.\n'
 }
 
 cmd_update_all() {
-  local kind repo_reason ran=0
+  local yes=${1:-0}
+  local force_check=${2:-1}
+  local kind repo_reason ran=0 latest
   detect_repo_update_required
-  if [ "$(state_get "update_required_kind")" != "self" ] && remote_check_due; then
+  if [ "$(state_get "update_required_kind")" != "self" ] && { [ "$force_check" -eq 1 ] || remote_check_due; }; then
     run_remote_update_check || true
   fi
   kind=$(state_get "update_required_kind")
+  latest=$(state_get "latest_version")
   repo_reason=$(repo_update_reason "$(git_root 2>/dev/null || true)" 2>/dev/null || true)
 
   if [ "$(state_get "update_required")" = "1" ] && [ "$kind" = "self" ]; then
-    cmd_update_self
+    printf 'Update available: %s\n' "${latest:-unknown}"
+    cmd_update_self "$yes"
     ran=1
   fi
 
   if [ -n "$repo_reason" ] || { [ "$(state_get "update_required")" = "1" ] && [ "$(state_get "update_required_kind")" = "repo" ]; }; then
-    cmd_update_repo
+    cmd_update_repo "$yes"
     ran=1
   fi
 
   if [ "$ran" -eq 0 ]; then
-    printf 'No update required.\n'
+    printf 'cxq is up to date: %s\n' "$CXQ_VERSION"
   fi
 
   if [ "$(state_get "update_required")" = "1" ]; then
@@ -1498,7 +1890,7 @@ cmd_update_all() {
 cmd_update() {
   require_sqlite3
 
-  local action=""
+  local action="" yes=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --status|--check|--self|--repo|--all)
@@ -1507,11 +1899,13 @@ cmd_update() {
         shift
         ;;
       --yes)
+        yes=1
         shift
         ;;
       --help|-h)
         cat <<'EOF'
 Usage:
+  cxq update [--yes]
   cxq update --status
   cxq update --check
   cxq update --self [--yes]
@@ -1529,16 +1923,16 @@ EOF
   case "${action:-}" in
     --status) print_update_status ;;
     --check) cmd_update_check ;;
-    --self) cmd_update_self ;;
-    --repo) cmd_update_repo ;;
-    --all) cmd_update_all ;;
-    *) die "update action is required." ;;
+    --self) cmd_update_self "$yes" ;;
+    --repo) cmd_update_repo "$yes" ;;
+    ""|--all) cmd_update_all "$yes" 1 ;;
+    *) die "unknown update action: $action" ;;
   esac
 }
 
 command_uses_update_gate() {
   case "${1:-}" in
-    add|list|ls|next|show|claim|claim-next|block|deps|unblock|note|prompt|review|done|repo|stale|release) return 0 ;;
+    add|list|ls|next|show|claim|claim-next|block|deps|unblock|note|prompt|review|done|repo|stale) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1561,14 +1955,14 @@ gate_read_answer() {
 }
 
 run_update_and_rerun() {
-  if ! CXQ_UPDATE_GATE_RERUN=1 "$0" update --all --yes; then
+  if ! CXQ_UPDATE_GATE_RERUN=1 "$0" update --yes; then
     printf 'Update failed. Command not run.\n' >&2
     return 1
   fi
 
   if [ "$(state_get "update_required")" = "1" ]; then
     printf '[update-required] cxq still needs an update before continuing.\n' >&2
-    printf 'Run: cxq update --all --yes\n' >&2
+    printf 'Run: cxq update --yes\n' >&2
     return 90
   fi
 
@@ -1583,7 +1977,7 @@ handle_update_required_gate() {
 
   if [ "${CXQ_UPDATE_GATE_RERUN:-}" = "1" ]; then
     printf '[update-required] cxq needs an update before continuing.\n' >&2
-    printf 'Run: cxq update --all --yes\n' >&2
+    printf 'Run: cxq update --yes\n' >&2
     printf 'Then retry the original command.\n' >&2
     return 90
   fi
@@ -1612,14 +2006,14 @@ handle_update_required_gate() {
         ;;
       *)
         printf 'Command not run.\n' >&2
-        printf 'Run: cxq update --all --yes\n' >&2
+        printf 'Run: cxq update --yes\n' >&2
         return 1
         ;;
     esac
   fi
 
   printf '[update-required] cxq needs an update before continuing.\n' >&2
-  printf 'Run: cxq update --all --yes\n' >&2
+  printf 'Run: cxq update --yes\n' >&2
   printf 'Then retry the original command.\n' >&2
   return 90
 }
@@ -1649,8 +2043,22 @@ main() {
   fi
 
   case "$command" in
-    -v|--version|version)
+    -v|--version)
       version
+      ;;
+    version)
+      shift
+      cmd_version "$@"
+      ;;
+    --check)
+      shift
+      [ "$#" -eq 0 ] || die "--check does not accept arguments."
+      cmd_update --check
+      ;;
+    --status)
+      shift
+      [ "$#" -eq 0 ] || die "--status does not accept arguments."
+      cmd_update --status
       ;;
     help|-h|--help)
       usage

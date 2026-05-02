@@ -75,17 +75,22 @@ Use this policy:
   - Example: `0.1.1` -> `1.0.0` only when the project is stable enough.
 - Docs-only, comments-only, test-only, or internal cleanup may skip version bump.
 
-When a version bump is needed, update:
+When a version bump is needed, use:
 
-1. `CXQ_VERSION` in `bin/cxq`
-2. README references if needed
-3. tests if behavior changed
-4. release notes draft if the change is release-worthy
+~~~sh
+cxq version bump patch
+cxq version bump minor
+cxq version bump major
+cxq version set X.Y.Z
+~~~
+
+Do not do manual search/replace for project versions.
 
 Do not create a Git tag.
 Do not publish a GitHub release.
 Do not run `gh release create`.
 Only prepare the version bump unless explicitly asked to release.
+Use `cxq release prepare X.Y.Z` before creating tags.
 
 Never publish or recommend publishing a release with a version lower than the local stable `CXQ_VERSION`.
 
@@ -153,31 +158,18 @@ If a version bump is needed but was not made, explain why.
 
 Only release when explicitly instructed.
 
-Manual release flow:
+Preferred release flow:
 
 ~~~sh
-git checkout main
-git pull --ff-only origin main
-make test
-
-git tag -a vX.Y.Z -m "cxq vX.Y.Z"
-git push origin vX.Y.Z
-
-gh release create vX.Y.Z \
-  --repo daniel-aranda/Agents-todo \
-  --title "cxq vX.Y.Z" \
-  --notes-file /tmp/cxq-release-vX.Y.Z.md \
-  --verify-tag \
-  --latest
+cxq release prepare X.Y.Z
+cxq release tag X.Y.Z
+cxq release publish X.Y.Z
 ~~~
 
-Before creating the release, verify:
+Only run the full publish path when explicitly asked:
 
 ~~~sh
-cxq version
-grep 'CXQ_VERSION=' bin/cxq
-git tag --list 'v*'
-gh release list --repo daniel-aranda/Agents-todo
+cxq release X.Y.Z --yes
 ~~~
 
 The version in `bin/cxq`, the Git tag, and the GitHub release must match.
@@ -245,7 +237,7 @@ When working on a claimed task:
 If `cxq` exits with an update-required message, run:
 
 ~~~sh
-cxq update --all --yes
+cxq update --yes
 ~~~
 
 Then retry the original command.
@@ -259,6 +251,7 @@ Expected commands include:
 ~~~sh
 cxq version
 cxq doctor
+cxq update
 cxq update --status
 cxq update --check
 cxq update --repo
@@ -377,7 +370,7 @@ Before starting queued work:
    - suggested next step
 
 If `cxq` exits with update-required, run:
-`cxq update --all --yes`
+`cxq update --yes`
 then retry the original command.
 
 Never mark a task `done` unless explicitly instructed.
