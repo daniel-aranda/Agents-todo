@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CXQ_VERSION="0.1.0"
+CXQ_VERSION="0.1.1"
+CXQ_REPO_SCHEMA_VERSION="1"
+CXQ_DEFAULT_REMOTE_URL="https://github.com/daniel-aranda/Agents-todo.git"
 
 die() {
   printf 'cxq: %s\n' "$*" >&2
@@ -16,6 +18,7 @@ Usage:
   cxq -v | --version
   cxq help
   cxq install
+  cxq update --status|--check|--self|--repo|--all [--yes]
   cxq add <title> [options]
   cxq list [--all] [--status <status>]
   cxq next [--format text|id|md]
@@ -41,6 +44,7 @@ Add options:
 
 Examples:
   cxq install
+  cxq update --status
   cxq add "Fix flaky auth refresh test" --priority 80 --files "src/auth,tests/auth"
   cxq next --format md
   cxq claim-next --agent codex --lease 2h --format prompt
@@ -220,6 +224,19 @@ CREATE TABLE IF NOT EXISTS task_events (
 CREATE INDEX IF NOT EXISTS idx_task_events_task_created
 ON task_events(task_id, created_at);
 
+CREATE TABLE IF NOT EXISTS cxq_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO cxq_meta (key, value)
+VALUES ('schema_version', '1');
+
+UPDATE cxq_meta
+SET value = '1'
+WHERE key = 'schema_version'
+  AND CAST(value AS INTEGER) < 1;
+
 CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
 AFTER UPDATE ON tasks
 FOR EACH ROW
@@ -264,6 +281,10 @@ Before starting queued work:
    - remaining risks
    - suggested next step
 
+If `cxq` exits with update-required, run:
+`cxq update --all --yes`
+then retry the original command.
+
 Never mark a task `done` unless explicitly instructed.
 EOF
 }
@@ -278,6 +299,203 @@ sqlite_value() {
   local db=$1
   local sql=$2
   sqlite3 -batch -noheader "$db" "$sql"
+}
+
+now_epoch() {
+  if [ -n "${CXQ_NOW_EPOCH:-}" ]; then
+    printf '%s' "$CXQ_NOW_EPOCH"
+  else
+    date +%s
+  fi
+}
+
+format_epoch() {
+  local epoch=${1-}
+  if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+    if date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ' >/dev/null 2>&1; then
+      date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ'
+    else
+      date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '%s' "$epoch"
+    fi
+  else
+    printf '%s' "$epoch"
+  fi
+}
+
+state_db_path() {
+  printf '%s/.cxq/state.db' "$HOME"
+}
+
+init_state_db() {
+  require_sqlite3
+  local db
+  db=$(state_db_path)
+  mkdir -p "$(dirname "$db")"
+  sqlite3 -batch "$db" "CREATE TABLE IF NOT EXISTS cxq_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+}
+
+state_get() {
+  local key=$1
+  local db
+  init_state_db
+  db=$(state_db_path)
+  sqlite3 -batch -noheader "$db" "SELECT value FROM cxq_state WHERE key = $(sql_quote "$key");"
+}
+
+state_set() {
+  local key=$1
+  local value=${2-}
+  local db
+  init_state_db
+  db=$(state_db_path)
+  sqlite3 -batch "$db" "INSERT OR REPLACE INTO cxq_state (key, value) VALUES ($(sql_quote "$key"), $(sql_quote "$value"));"
+}
+
+mark_update_required() {
+  local kind=$1
+  local reason=$2
+  local latest=${3-}
+  state_set "update_required" "1"
+  state_set "update_required_kind" "$kind"
+  state_set "update_required_reason" "$reason"
+  state_set "update_required_since" "$(now_epoch)"
+  if [ -n "$latest" ]; then
+    state_set "latest_version" "$latest"
+  fi
+}
+
+clear_update_required() {
+  state_set "update_required" "0"
+  state_set "update_required_kind" ""
+  state_set "update_required_reason" ""
+  state_set "update_required_since" ""
+}
+
+clear_update_required_if_kind() {
+  local kind=$1
+  local current
+  current=$(state_get "update_required_kind")
+  if [ "$(state_get "update_required")" = "1" ] && [ "$current" = "$kind" ]; then
+    clear_update_required
+  fi
+}
+
+stable_semver() {
+  local version=${1#v}
+  if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    printf '%s' "$version"
+    return 0
+  fi
+  return 1
+}
+
+semver_gt() {
+  local left right
+  left=$(stable_semver "$1") || return 1
+  right=$(stable_semver "$2") || return 1
+
+  local l_major l_minor l_patch r_major r_minor r_patch
+  IFS=. read -r l_major l_minor l_patch <<<"$left"
+  IFS=. read -r r_major r_minor r_patch <<<"$right"
+
+  if [ "$((10#$l_major))" -gt "$((10#$r_major))" ]; then return 0; fi
+  if [ "$((10#$l_major))" -lt "$((10#$r_major))" ]; then return 1; fi
+  if [ "$((10#$l_minor))" -gt "$((10#$r_minor))" ]; then return 0; fi
+  if [ "$((10#$l_minor))" -lt "$((10#$r_minor))" ]; then return 1; fi
+  [ "$((10#$l_patch))" -gt "$((10#$r_patch))" ]
+}
+
+highest_stable_version_from_lsremote() {
+  local lines=$1
+  local line ref version highest=""
+
+  while IFS= read -r line; do
+    ref=${line##*refs/tags/}
+    version=$(stable_semver "$ref" 2>/dev/null || true)
+    if [ -z "$version" ]; then
+      continue
+    fi
+    if [ -z "$highest" ] || semver_gt "$version" "$highest"; then
+      highest=$version
+    fi
+  done <<<"$lines"
+
+  if [ -n "$highest" ]; then
+    printf 'v%s' "$highest"
+  fi
+}
+
+update_remote_url() {
+  local remote
+  remote=$(state_get "install_remote_url")
+  if [ -n "$remote" ]; then
+    printf '%s' "$remote"
+  else
+    printf '%s' "$CXQ_DEFAULT_REMOTE_URL"
+  fi
+}
+
+record_update_check_result() {
+  local result=$1
+  state_set "last_update_check_at" "$(now_epoch)"
+  state_set "last_update_check_result" "$result"
+}
+
+run_remote_update_check() {
+  local remote output status latest latest_stable reason
+  remote=$(update_remote_url)
+
+  if [ -n "${CXQ_TEST_LATEST_VERSION:-}" ]; then
+    if [ "$CXQ_TEST_LATEST_VERSION" = "fail" ]; then
+      record_update_check_result "failed: test remote failure"
+      return 1
+    fi
+    latest_stable=$(stable_semver "$CXQ_TEST_LATEST_VERSION" 2>/dev/null || true)
+    if [ -n "$latest_stable" ]; then
+      latest="v$latest_stable"
+    else
+      latest=""
+    fi
+  else
+    set +e
+    output=$(GIT_TERMINAL_PROMPT=0 git ls-remote --tags --refs "$remote" "v*" 2>&1)
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+      record_update_check_result "failed: $output"
+      return 1
+    fi
+    latest=$(highest_stable_version_from_lsremote "$output")
+  fi
+
+  if [ -z "$latest" ]; then
+    state_set "latest_version" ""
+    record_update_check_result "ok: no stable tags found"
+    clear_update_required_if_kind "self"
+    return 0
+  fi
+
+  state_set "latest_version" "$latest"
+  if semver_gt "$latest" "$CXQ_VERSION"; then
+    reason="cxq $latest is available; installed version is $CXQ_VERSION."
+    mark_update_required "self" "$reason" "$latest"
+    record_update_check_result "update-available: $latest"
+    return 0
+  fi
+
+  record_update_check_result "up-to-date: $latest"
+  clear_update_required_if_kind "self"
+  return 0
+}
+
+remote_check_due() {
+  local last now
+  last=$(state_get "last_update_check_at")
+  now=$(now_epoch)
+  if ! [[ "$last" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+  [ "$((now - last))" -gt 86400 ]
 }
 
 log_event() {
@@ -326,12 +544,9 @@ write_file_if_missing() {
   printf 'Created: %s\n' "$label"
 }
 
-cmd_install() {
-  require_macos
-  require_sqlite3
-
-  local root codex_dir schema_file prompt_dir prompt_file db
-  root=$(install_root_or_die)
+setup_project_queue() {
+  local root=$1
+  local codex_dir schema_file prompt_dir prompt_file db
   codex_dir="$root/.codex"
   schema_file="$codex_dir/tasks.schema.sql"
   prompt_dir="$codex_dir/prompts"
@@ -347,6 +562,65 @@ cmd_install() {
 
   printf 'cxq installed for project: %s\n' "$root"
   printf 'Database: %s\n' "$db"
+}
+
+cmd_install() {
+  require_macos
+  require_sqlite3
+
+  local root
+  root=$(install_root_or_die)
+  setup_project_queue "$root"
+}
+
+repo_update_reason() {
+  local root=${1-}
+  local db version reasons=""
+
+  if [ -z "$root" ]; then
+    root=$(git_root 2>/dev/null || true)
+    [ -n "$root" ] || return 1
+    root=$(physical_path "$root")
+  fi
+
+  db="$root/.codex/tasks.db"
+
+  [ -f "$db" ] || reasons="${reasons}${reasons:+; }missing .codex/tasks.db"
+  [ -f "$root/.codex/tasks.schema.sql" ] || reasons="${reasons}${reasons:+; }missing .codex/tasks.schema.sql"
+  [ -f "$root/.codex/prompts/task.md" ] || reasons="${reasons}${reasons:+; }missing .codex/prompts/task.md"
+  if [ ! -f "$root/AGENTS.md" ] || ! grep -qxF "## Local task queue" "$root/AGENTS.md"; then
+    reasons="${reasons}${reasons:+; }missing AGENTS.md cxq block"
+  fi
+
+  if [ -f "$db" ]; then
+    version=$(sqlite3 -batch -noheader "$db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';" 2>/dev/null || true)
+    if ! [[ "$version" =~ ^[0-9]+$ ]]; then
+      version=0
+    fi
+    if [ "$version" -lt "$CXQ_REPO_SCHEMA_VERSION" ]; then
+      reasons="${reasons}${reasons:+; }repo schema version $version is lower than $CXQ_REPO_SCHEMA_VERSION"
+    fi
+  fi
+
+  if [ -n "$reasons" ]; then
+    printf '%s' "$reasons"
+    return 0
+  fi
+  return 1
+}
+
+detect_repo_update_required() {
+  local root reason
+  root=$(git_root 2>/dev/null || true)
+  [ -n "$root" ] || return 0
+  root=$(physical_path "$root")
+
+  reason=$(repo_update_reason "$root" || true)
+  if [ -n "$reason" ]; then
+    if [ "$(state_get "update_required")" != "1" ]; then
+      mark_update_required "repo" "Project queue update required: $reason"
+    fi
+  fi
 }
 
 current_actor() {
@@ -950,8 +1224,262 @@ cmd_release() {
   printf 'Released task #%s\n' "$id"
 }
 
+print_update_status() {
+  init_state_db
+  local latest last required kind reason result since
+  latest=$(state_get "latest_version")
+  last=$(state_get "last_update_check_at")
+  required=$(state_get "update_required")
+  kind=$(state_get "update_required_kind")
+  reason=$(state_get "update_required_reason")
+  result=$(state_get "last_update_check_result")
+  since=$(state_get "update_required_since")
+
+  printf 'current_version: %s\n' "$CXQ_VERSION"
+  printf 'latest_known_version: %s\n' "${latest:-unknown}"
+  if [ -n "$last" ]; then
+    printf 'last_update_check_at: %s (%s)\n' "$last" "$(format_epoch "$last")"
+  else
+    printf 'last_update_check_at: never\n'
+  fi
+  printf 'update_required: %s\n' "${required:-0}"
+  printf 'update_required_kind: %s\n' "${kind:-none}"
+  printf 'update_required_reason: %s\n' "${reason:-none}"
+  if [ -n "$since" ]; then
+    printf 'update_required_since: %s (%s)\n' "$since" "$(format_epoch "$since")"
+  fi
+  printf 'last_update_check_result: %s\n' "${result:-none}"
+}
+
+cmd_update_check() {
+  run_remote_update_check || true
+  printf '%s\n' "$(state_get "last_update_check_result")"
+  if [ "$(state_get "update_required")" = "1" ]; then
+    printf 'Update required: %s\n' "$(state_get "update_required_reason")"
+  else
+    printf 'No update required.\n'
+  fi
+}
+
+cmd_update_self() {
+  local source_dir bin_path prefix
+  source_dir=$(state_get "install_source_dir")
+  bin_path=$(state_get "install_bin_path")
+
+  if [ -z "$source_dir" ] || [ ! -d "$source_dir/.git" ] || [ ! -f "$source_dir/install.sh" ]; then
+    printf 'cxq self-update cannot run automatically from this install.\n' >&2
+    printf 'Clone or pull the cxq repository manually, then run ./install.sh.\n' >&2
+    return 1
+  fi
+
+  GIT_TERMINAL_PROMPT=0 git -C "$source_dir" fetch --tags --quiet
+  GIT_TERMINAL_PROMPT=0 git -C "$source_dir" pull --ff-only
+
+  if [ -n "$bin_path" ]; then
+    prefix=$(dirname "$(dirname "$bin_path")")
+    PREFIX="$prefix" "$source_dir/install.sh"
+  else
+    "$source_dir/install.sh"
+  fi
+
+  clear_update_required_if_kind "self"
+}
+
+cmd_update_repo() {
+  local root reason
+  root=$(project_root_or_die)
+  setup_project_queue "$root"
+  reason=$(repo_update_reason "$root" || true)
+  if [ -n "$reason" ]; then
+    mark_update_required "repo" "Project queue update required: $reason"
+    printf 'Repo update is still required: %s\n' "$reason" >&2
+    return 1
+  fi
+  clear_update_required_if_kind "repo"
+}
+
+cmd_update_all() {
+  local kind repo_reason ran=0
+  detect_repo_update_required
+  if [ "$(state_get "update_required_kind")" != "self" ] && remote_check_due; then
+    run_remote_update_check || true
+  fi
+  kind=$(state_get "update_required_kind")
+  repo_reason=$(repo_update_reason "$(git_root 2>/dev/null || true)" 2>/dev/null || true)
+
+  if [ "$(state_get "update_required")" = "1" ] && [ "$kind" = "self" ]; then
+    cmd_update_self
+    ran=1
+  fi
+
+  if [ -n "$repo_reason" ] || { [ "$(state_get "update_required")" = "1" ] && [ "$(state_get "update_required_kind")" = "repo" ]; }; then
+    cmd_update_repo
+    ran=1
+  fi
+
+  if [ "$ran" -eq 0 ]; then
+    printf 'No update required.\n'
+  fi
+
+  if [ "$(state_get "update_required")" = "1" ]; then
+    printf 'Update is still required: %s\n' "$(state_get "update_required_reason")" >&2
+    return 1
+  fi
+}
+
+cmd_update() {
+  require_sqlite3
+
+  local action=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --status|--check|--self|--repo|--all)
+        [ -z "$action" ] || die "choose only one update action."
+        action=$1
+        shift
+        ;;
+      --yes)
+        shift
+        ;;
+      --help|-h)
+        cat <<'EOF'
+Usage:
+  cxq update --status
+  cxq update --check
+  cxq update --self [--yes]
+  cxq update --repo [--yes]
+  cxq update --all [--yes]
+EOF
+        exit 0
+        ;;
+      *)
+        die "unknown update option: $1"
+        ;;
+    esac
+  done
+
+  case "${action:-}" in
+    --status) print_update_status ;;
+    --check) cmd_update_check ;;
+    --self) cmd_update_self ;;
+    --repo) cmd_update_repo ;;
+    --all) cmd_update_all ;;
+    *) die "update action is required." ;;
+  esac
+}
+
+command_uses_update_gate() {
+  case "${1:-}" in
+    add|list|ls|next|show|claim|claim-next|note|prompt|review|done|repo|stale|release) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+gate_is_interactive() {
+  if [ -n "${CXQ_TEST_TTY_ANSWER:-}" ]; then
+    return 0
+  fi
+  [ -t 0 ] && [ -t 2 ]
+}
+
+gate_read_answer() {
+  if [ -n "${CXQ_TEST_TTY_ANSWER:-}" ]; then
+    printf '%s' "$CXQ_TEST_TTY_ANSWER"
+    return 0
+  fi
+  local answer
+  IFS= read -r answer </dev/tty || answer=""
+  printf '%s' "$answer"
+}
+
+run_update_and_rerun() {
+  if ! CXQ_UPDATE_GATE_RERUN=1 "$0" update --all --yes; then
+    printf 'Update failed. Command not run.\n' >&2
+    return 1
+  fi
+
+  if [ "$(state_get "update_required")" = "1" ]; then
+    printf '[update-required] cxq still needs an update before continuing.\n' >&2
+    printf 'Run: cxq update --all --yes\n' >&2
+    return 90
+  fi
+
+  CXQ_UPDATE_GATE_RERUN=1 exec "$0" "$@"
+}
+
+handle_update_required_gate() {
+  local original_command="$*"
+  local latest reason
+  latest=$(state_get "latest_version")
+  reason=$(state_get "update_required_reason")
+
+  if [ "${CXQ_UPDATE_GATE_RERUN:-}" = "1" ]; then
+    printf '[update-required] cxq needs an update before continuing.\n' >&2
+    printf 'Run: cxq update --all --yes\n' >&2
+    printf 'Then retry the original command.\n' >&2
+    return 90
+  fi
+
+  if [ "${CXQ_ASSUME_YES:-}" = "1" ]; then
+    run_update_and_rerun "$@"
+    return $?
+  fi
+
+  if gate_is_interactive; then
+    local answer
+    {
+      printf 'cxq update required.\n'
+      printf 'Installed version: %s\n' "$CXQ_VERSION"
+      [ -n "$latest" ] && printf 'Latest version: %s\n' "$latest"
+      printf 'Reason: %s\n' "${reason:-update required}"
+      printf 'Command: cxq %s\n' "$original_command"
+      printf 'Run update now? [Y/n] '
+    } >&2
+    answer=$(gate_read_answer)
+    printf '\n' >&2
+    case "$answer" in
+      ""|y|Y|yes|YES|Yes)
+        run_update_and_rerun "$@"
+        return $?
+        ;;
+      *)
+        printf 'Command not run.\n' >&2
+        printf 'Run: cxq update --all --yes\n' >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  printf '[update-required] cxq needs an update before continuing.\n' >&2
+  printf 'Run: cxq update --all --yes\n' >&2
+  printf 'Then retry the original command.\n' >&2
+  return 90
+}
+
+run_update_gate() {
+  [ "${CXQ_NO_UPDATE_CHECK:-}" = "1" ] && return 0
+
+  init_state_db
+  detect_repo_update_required
+
+  if [ "$(state_get "update_required")" != "1" ]; then
+    if remote_check_due; then
+      run_remote_update_check || true
+    fi
+  fi
+
+  if [ "$(state_get "update_required")" = "1" ]; then
+    handle_update_required_gate "$@"
+    return $?
+  fi
+}
+
 main() {
   local command=${1:-help}
+  if command_uses_update_gate "$command"; then
+    run_update_gate "$@"
+  fi
+
   case "$command" in
     -v|--version|version)
       version
@@ -963,6 +1491,13 @@ main() {
       shift
       [ "$#" -eq 0 ] || die "install does not accept arguments."
       cmd_install
+      ;;
+    update)
+      shift
+      cmd_update "$@"
+      ;;
+    doctor)
+      printf 'cxq doctor: no checks implemented yet.\n'
       ;;
     add)
       shift

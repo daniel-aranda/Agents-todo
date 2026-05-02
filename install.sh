@@ -28,6 +28,35 @@ path_contains() {
   esac
 }
 
+sql_quote() {
+  local value=${1-}
+  value=${value//\'/\'\'}
+  printf "'%s'" "$value"
+}
+
+state_set() {
+  local db key value
+  db="$HOME/.cxq/state.db"
+  key=$1
+  value=${2-}
+  mkdir -p "$(dirname "$db")"
+  sqlite3 -batch "$db" "CREATE TABLE IF NOT EXISTS cxq_state (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT OR REPLACE INTO cxq_state (key, value) VALUES ($(sql_quote "$key"), $(sql_quote "$value"));"
+}
+
+record_install_metadata() {
+  local source_dir=$1
+  local bin_path=$2
+  local remote_url=""
+
+  if [ -d "$source_dir/.git" ]; then
+    remote_url=$(git -C "$source_dir" config --get remote.origin.url 2>/dev/null || true)
+  fi
+
+  state_set "install_source_dir" "$source_dir"
+  state_set "install_bin_path" "$bin_path"
+  state_set "install_remote_url" "$remote_url"
+}
+
 choose_prefix() {
   local candidate bin
 
@@ -53,6 +82,8 @@ choose_prefix() {
 if [ "$(uname -s)" != "Darwin" ]; then
   die "cxq currently supports macOS only."
 fi
+
+command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 is required but was not found."
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 source_cli="$script_dir/bin/cxq"
@@ -86,6 +117,7 @@ target="$install_dir/cxq"
 mkdir -p "$install_dir"
 cp "$source_cli" "$target"
 chmod 0755 "$target"
+record_install_metadata "$script_dir" "$target"
 
 printf 'Installed cxq to %s\n' "$target"
 "$target" -v

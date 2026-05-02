@@ -7,6 +7,11 @@ TEST_DIR=$(mktemp -d "$TMP_ROOT/cxq-tests.XXXXXX")
 PREFIX="$TEST_DIR/prefix"
 CXQ="$PREFIX/bin/cxq"
 PASS=0
+export HOME="$TEST_DIR/home"
+export CXQ_TEST_LATEST_VERSION="v0.1.1"
+export CXQ_NOW_EPOCH="1000000"
+
+mkdir -p "$HOME"
 
 cleanup() {
   rm -rf "$TEST_DIR"
@@ -56,17 +61,34 @@ assert_not_exists() {
 }
 
 run_git_init() {
+  rm -rf "$HOME/.cxq"
   git init -q "$1"
   git -C "$1" config user.email test@example.com
   git -C "$1" config user.name "cxq test"
 }
 
+state_db() {
+  printf '%s/.cxq/state.db' "$HOME"
+}
+
+state_get() {
+  sqlite3 -batch -noheader "$(state_db)" "SELECT value FROM cxq_state WHERE key = '$1';"
+}
+
+state_set() {
+  mkdir -p "$HOME/.cxq"
+  sqlite3 -batch "$(state_db)" "CREATE TABLE IF NOT EXISTS cxq_state (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT OR REPLACE INTO cxq_state (key, value) VALUES ('$1', '$2');"
+}
+
 test_installer_and_version() {
   PREFIX="$PREFIX" "$ROOT/install.sh" >/tmp/cxq-install-test.out
   assert_file "$CXQ"
+  assert_file "$HOME/.cxq/state.db"
+  [ "$(state_get "install_bin_path")" = "$CXQ" ] || fail "installer should record install_bin_path"
+  [ "$(state_get "install_source_dir")" = "$ROOT" ] || fail "installer should record install_source_dir"
   local output
   output=$("$CXQ" -v)
-  assert_contains "$output" "cxq 0.1.0" "cxq -v prints version"
+  assert_contains "$output" "cxq 0.1.1" "cxq -v prints version"
   pass "installer creates a working cxq command"
 }
 
@@ -358,6 +380,240 @@ test_files_globs_are_preserved_literally() {
   pass "file globs are preserved literally in allowed paths"
 }
 
+test_update_status_creates_state_db() {
+  local output
+  rm -rf "$HOME/.cxq"
+  output=$("$CXQ" update --status)
+  assert_file "$HOME/.cxq/state.db"
+  assert_contains "$output" "current_version: 0.1.1"
+  assert_contains "$output" "update_required: 0"
+  pass "update status creates and reports global state"
+}
+
+test_update_check_skips_before_24h() {
+  local repo result
+  repo="$TEST_DIR/update-skip-before-24h"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  state_set "last_update_check_at" "1000"
+  state_set "last_update_check_result" "old-result"
+
+  (cd "$repo" && CXQ_NOW_EPOCH=2000 CXQ_TEST_LATEST_VERSION=v9.9.9 "$CXQ" list >/dev/null)
+  result=$(state_get "last_update_check_result")
+  [ "$result" = "old-result" ] || fail "remote check should not run before 24h"
+  [ "$(state_get "update_required")" != "1" ] || fail "update should not be marked before 24h"
+  pass "daily update check does not run before 24h"
+}
+
+test_update_check_runs_after_24h() {
+  local repo result checked_at
+  repo="$TEST_DIR/update-runs-after-24h"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  state_set "last_update_check_at" "1000"
+  state_set "last_update_check_result" "old-result"
+
+  (cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION=v0.1.1 "$CXQ" list >/dev/null)
+  result=$(state_get "last_update_check_result")
+  checked_at=$(state_get "last_update_check_at")
+  assert_contains "$result" "up-to-date"
+  [ "$checked_at" = "90000" ] || fail "expected last_update_check_at to be updated"
+  pass "daily update check runs after 24h"
+}
+
+test_latest_version_marks_update_required() {
+  local repo output
+  repo="$TEST_DIR/update-latest-required"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v0.1.2 "$CXQ" update --check)
+  assert_contains "$output" "update-available: v0.1.2"
+  [ "$(state_get "update_required")" = "1" ] || fail "newer latest version should mark update required"
+  [ "$(state_get "update_required_kind")" = "self" ] || fail "newer latest version should require self update"
+  [ "$(state_get "latest_version")" = "v0.1.2" ] || fail "latest version should be recorded"
+  pass "newer latest version marks self update required"
+}
+
+test_update_required_gates_normal_commands() {
+  local repo output status
+  repo="$TEST_DIR/update-required-gates"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  state_set "update_required" "1"
+  state_set "update_required_kind" "self"
+  state_set "update_required_reason" "test update required"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" list 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 90 ] || fail "expected exit 90, got $status"
+  assert_contains "$output" "[update-required] cxq needs an update before continuing."
+  pass "update_required gates normal commands"
+}
+
+test_interactive_update_prompt_yes() {
+  local repo output count
+  repo="$TEST_DIR/update-interactive-yes"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  rm "$repo/.codex/prompts/task.md"
+
+  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=y "$CXQ" add "After yes" 2>&1)
+  assert_contains "$output" "Run update now? [Y/n]"
+  assert_contains "$output" "Created task #"
+  assert_file "$repo/.codex/prompts/task.md"
+  count=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'After yes';")
+  [ "$count" = "1" ] || fail "interactive yes should rerun original command"
+  pass "interactive update prompt yes path updates and reruns"
+}
+
+test_interactive_update_prompt_no() {
+  local repo output status count
+  repo="$TEST_DIR/update-interactive-no"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  rm "$repo/.codex/prompts/task.md"
+
+  set +e
+  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=n "$CXQ" add "After no" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "interactive no should fail"
+  assert_contains "$output" "Command not run."
+  count=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'After no';")
+  [ "$count" = "0" ] || fail "interactive no should not run original command"
+  pass "interactive update prompt no path blocks command"
+}
+
+test_noninteractive_update_gate_exits_90() {
+  local repo output status
+  repo="$TEST_DIR/update-noninteractive"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  state_set "update_required" "1"
+  state_set "update_required_kind" "repo"
+  state_set "update_required_reason" "repo setup missing"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" list 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 90 ] || fail "non-interactive gate should exit 90"
+  assert_contains "$output" "Then retry the original command."
+  pass "non-interactive gate exits 90 without hanging"
+}
+
+test_no_update_check_bypasses_gate() {
+  local repo status
+  repo="$TEST_DIR/update-bypass"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  state_set "update_required" "1"
+  state_set "update_required_kind" "self"
+  state_set "update_required_reason" "test bypass"
+
+  set +e
+  (cd "$repo" && CXQ_NO_UPDATE_CHECK=1 "$CXQ" list >/dev/null)
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || fail "CXQ_NO_UPDATE_CHECK should bypass the gate"
+  pass "CXQ_NO_UPDATE_CHECK bypasses update gate"
+}
+
+test_assume_yes_attempts_update() {
+  local repo output count
+  repo="$TEST_DIR/update-assume-yes"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  rm "$repo/.codex/prompts/task.md"
+
+  output=$(cd "$repo" && CXQ_ASSUME_YES=1 "$CXQ" add "Assume yes" 2>&1)
+  assert_contains "$output" "Created task #"
+  assert_file "$repo/.codex/prompts/task.md"
+  count=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'Assume yes';")
+  [ "$count" = "1" ] || fail "CXQ_ASSUME_YES should update and rerun original command"
+  pass "CXQ_ASSUME_YES attempts automatic update"
+}
+
+test_update_check_command() {
+  local repo output
+  repo="$TEST_DIR/update-check-command"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v0.1.1 "$CXQ" update --check)
+  assert_contains "$output" "up-to-date: v0.1.1"
+  assert_contains "$output" "No update required."
+  pass "update --check records remote check result"
+}
+
+test_prerelease_update_tags_are_ignored() {
+  local repo output
+  repo="$TEST_DIR/update-prerelease"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v9.0.0-alpha.1 "$CXQ" update --check)
+  assert_contains "$output" "ok: no stable tags found"
+  [ "$(state_get "update_required")" != "1" ] || fail "prerelease tags should not require updates"
+  pass "prerelease update tags are ignored"
+}
+
+test_update_all_yes_repairs_repo_setup() {
+  local repo output
+  repo="$TEST_DIR/update-all-repo"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  rm "$repo/.codex/prompts/task.md"
+  state_set "update_required" "1"
+  state_set "update_required_kind" "repo"
+  state_set "update_required_reason" "missing prompt"
+
+  output=$(cd "$repo" && "$CXQ" update --all --yes)
+  assert_contains "$output" "Created: .codex/prompts/task.md"
+  assert_file "$repo/.codex/prompts/task.md"
+  [ "$(state_get "update_required")" = "0" ] || fail "update --all --yes should clear repo update requirement"
+  pass "update --all --yes repairs repo setup"
+}
+
+test_failed_remote_check_does_not_block() {
+  local repo output result status
+  repo="$TEST_DIR/update-remote-fails"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  state_set "install_remote_url" "/definitely/not/a/repo"
+  state_set "last_update_check_at" "1000"
+
+  set +e
+  output=$(cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION= "$CXQ" list 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || fail "failed remote check should not block normal usage. Output: $output"
+  result=$(state_get "last_update_check_result")
+  assert_contains "$result" "failed:"
+  pass "failed remote update check does not block normal usage"
+}
+
+test_repeated_update_gate_does_not_loop() {
+  local repo output status
+  repo="$TEST_DIR/update-rerun-loop"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  state_set "update_required" "1"
+  state_set "update_required_kind" "self"
+  state_set "update_required_reason" "still required"
+
+  set +e
+  output=$(cd "$repo" && CXQ_UPDATE_GATE_RERUN=1 "$CXQ" list 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 90 ] || fail "rerun gate should fail with exit 90"
+  assert_contains "$output" "cxq needs an update before continuing"
+  pass "repeated update gate fails instead of looping"
+}
+
 test_commands_work_from_repo_subdirectory_after_install() {
   local repo output
   repo="$TEST_DIR/subdir-use"
@@ -385,6 +641,21 @@ test_claim_next_second_attempt_fails_cleanly
 test_claim_next_prompt_lifecycle
 test_release_clears_claim_fields
 test_files_globs_are_preserved_literally
+test_update_status_creates_state_db
+test_update_check_skips_before_24h
+test_update_check_runs_after_24h
+test_latest_version_marks_update_required
+test_update_required_gates_normal_commands
+test_interactive_update_prompt_yes
+test_interactive_update_prompt_no
+test_noninteractive_update_gate_exits_90
+test_no_update_check_bypasses_gate
+test_assume_yes_attempts_update
+test_update_check_command
+test_prerelease_update_tags_are_ignored
+test_update_all_yes_repairs_repo_setup
+test_failed_remote_check_does_not_block
+test_repeated_update_gate_does_not_loop
 test_commands_work_from_repo_subdirectory_after_install
 
 printf '\n%s tests passed\n' "$PASS"

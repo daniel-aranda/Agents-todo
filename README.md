@@ -140,6 +140,11 @@ The current version of `cxq` is intentionally small:
 ```sh
 cxq -v
 cxq install
+cxq update --status
+cxq update --check
+cxq update --self --yes
+cxq update --repo --yes
+cxq update --all --yes
 cxq add "Fix flaky auth refresh test"
 cxq list
 cxq next
@@ -222,6 +227,41 @@ shown as stale or made available again.
 Use `cxq stale` to list expired claims and `cxq release 42` to return a claimed
 task to `ready`.
 
+## Updates
+
+`cxq` keeps small global state in `~/.cxq/state.db`.
+
+For normal queue commands, `cxq` checks whether an update is required before it
+continues. Remote self-update checks use `git ls-remote` at most once per day.
+If a newer stable `vMAJOR.MINOR.PATCH` tag is found, or if the current project
+queue setup is missing required local files, normal commands are gated until
+the update is handled.
+
+Useful commands:
+
+```sh
+cxq update --status
+cxq update --check
+cxq update --self --yes
+cxq update --repo --yes
+cxq update --all --yes
+```
+
+`cxq update --self` only auto-updates when `install.sh` recorded a Git checkout
+as the install source. It fetches tags, pulls with `--ff-only`, and reruns that
+checkout's `install.sh`. `cxq update --repo` reapplies the safe project setup
+without overwriting customized schema, prompt, or `AGENTS.md` files.
+
+Escape hatches:
+
+```sh
+CXQ_NO_UPDATE_CHECK=1 cxq list
+CXQ_ASSUME_YES=1 cxq claim-next --format prompt
+```
+
+`CXQ_NO_UPDATE_CHECK=1` skips the gate. `CXQ_ASSUME_YES=1` lets `cxq` attempt
+`cxq update --all --yes` automatically when an update is required.
+
 ## Agent contract
 
 `cxq install` should create or update an `AGENTS.md` section that tells Codex how
@@ -248,6 +288,10 @@ Before starting queued work:
    - tests run
    - remaining risks
    - suggested next step
+
+If `cxq` exits with update-required, run:
+`cxq update --all --yes`
+then retry the original command.
 
 Never mark a task `done` unless explicitly instructed.
 ```
