@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CXQ_VERSION="0.1.1"
+CXQ_VERSION="0.2.0"
 CXQ_REPO_SCHEMA_VERSION="2"
 CXQ_DEFAULT_REMOTE_URL="https://github.com/daniel-aranda/Agents-todo.git"
 
