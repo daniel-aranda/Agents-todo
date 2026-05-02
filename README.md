@@ -24,6 +24,31 @@ cxq install
 
 `cxq install` initializes the queue for that project.
 
+## What it looks like
+
+~~~bash
+$ cxq list
+
+id  status  priority  title
+--  ------  --------  ------------------------------------------------------------
+1   ready   100       Scaffold Node.js TypeScript project foundation
+2   ready   95        Create initial PostgreSQL schema migrations
+3   ready   92        Implement local service setup and connectivity checks
+4   ready   90        Build shared Polymarket API client foundation
+5   ready   88        Implement Gamma active market catalog collector
+6   ready   84        Implement candidate trader seeding jobs
+7   ready   80        Implement wallet activity and position snapshot polling
+8   ready   76        Implement position snapshot diff engine
+9   ready   72        Implement trader scoring v0
+10  ready   68        Implement liquidity checker and paper signal engine v0
+11  ready   64        Implement paper signal evaluation and reporting
+~~~
+
+Then hand the next task to your agent:
+~~~bash
+cxq claim-next --agent codex --lease 2h --format prompt
+~~~
+
 ## Requirements
 
 - macOS
