@@ -237,6 +237,7 @@ When working on a claimed task:
 
 - Work only on the claimed task.
 - Respect allowed paths unless the task clearly requires more scope.
+- Use `cxq deps <id>` to inspect blockers before working a task with known dependencies.
 - Use `cxq note <id> "..."` for important discoveries.
 - Run the verification command when present.
 - Move implementation work to `review`, not `done`, unless explicitly instructed.
@@ -300,6 +301,7 @@ Use SQLite carefully.
 - Preserve user data.
 - Do not delete `.codex/tasks.db` unless explicitly instructed.
 - Store schema version with `PRAGMA user_version` when applicable.
+- Store task dependencies in `task_dependencies`; do not rely on `deps_json` for claimability.
 - Keep event history append-only when possible.
 
 ## Shell portability
@@ -365,9 +367,10 @@ Before starting queued work:
 1. Claim exactly one task with `cxq claim-next --agent codex --lease 2h --format prompt`.
 2. Work only on the claimed task.
 3. Respect `allowed_paths` unless the task clearly requires more scope.
-4. Run the task's `verify_command` when present.
-5. Add notes with `cxq note <id> "..."`.
-6. End by moving the task to `review`, with:
+4. Use `cxq deps <id>` to inspect blockers when dependency context matters.
+5. Run the task's `verify_command` when present.
+6. Add notes with `cxq note <id> "..."`.
+7. End by moving the task to `review`, with:
    - files changed
    - tests run
    - remaining risks

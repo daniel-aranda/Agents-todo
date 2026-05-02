@@ -343,6 +343,89 @@ test_claim_next_prompt_lifecycle() {
   pass "claim-next prompt lifecycle works"
 }
 
+test_dependencies_skip_blocked_tasks() {
+  local repo blocker dependent claimed deps
+  repo="$TEST_DIR/deps-skip-blocked"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  blocker=$(cd "$repo" && "$CXQ" add "Low priority blocker" --priority 10)
+  blocker=${blocker##*#}
+  dependent=$(cd "$repo" && "$CXQ" add "High priority dependent" --priority 99)
+  dependent=${dependent##*#}
+  (cd "$repo" && "$CXQ" block "$dependent" --by "$blocker" >/dev/null)
+
+  deps=$(cd "$repo" && "$CXQ" deps "$dependent")
+  assert_contains "$deps" "#$blocker [ready] Low priority blocker"
+  claimed=$(cd "$repo" && "$CXQ" claim-next --format id)
+  [ "$claimed" = "$blocker" ] || fail "claim-next should skip blocked high-priority task"
+  pass "claim-next skips blocked tasks"
+}
+
+test_dependencies_unblocked_task_becomes_claimable() {
+  local repo blocker dependent claimed
+  repo="$TEST_DIR/deps-unblock"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  blocker=$(cd "$repo" && "$CXQ" add "Temporary blocker" --priority 10)
+  blocker=${blocker##*#}
+  dependent=$(cd "$repo" && "$CXQ" add "Unblocked dependent" --priority 99)
+  dependent=${dependent##*#}
+  (cd "$repo" && "$CXQ" block "$dependent" --by "$blocker" >/dev/null)
+  (cd "$repo" && "$CXQ" unblock "$dependent" --by "$blocker" >/dev/null)
+
+  claimed=$(cd "$repo" && "$CXQ" claim-next --format id)
+  [ "$claimed" = "$dependent" ] || fail "unblocked highest-priority task should be claimable"
+  pass "unblocked tasks become claimable"
+}
+
+test_done_blocker_allows_dependent_task() {
+  local repo blocker dependent claimed
+  repo="$TEST_DIR/deps-done-blocker"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  blocker=$(cd "$repo" && "$CXQ" add "Done blocker" --priority 10)
+  blocker=${blocker##*#}
+  dependent=$(cd "$repo" && "$CXQ" add "Dependent after done" --priority 99)
+  dependent=${dependent##*#}
+  (cd "$repo" && "$CXQ" block "$dependent" --by "$blocker" >/dev/null)
+  (cd "$repo" && "$CXQ" done "$blocker" --summary "Accepted" >/dev/null)
+
+  claimed=$(cd "$repo" && "$CXQ" claim-next --format id)
+  [ "$claimed" = "$dependent" ] || fail "dependent should be claimable once blocker is done"
+  pass "done blockers allow dependent tasks"
+}
+
+test_dependency_rejects_self_and_cycle() {
+  local repo first second output status
+  repo="$TEST_DIR/deps-reject"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  first=$(cd "$repo" && "$CXQ" add "First")
+  first=${first##*#}
+  second=$(cd "$repo" && "$CXQ" add "Second")
+  second=${second##*#}
+  (cd "$repo" && "$CXQ" block "$second" --by "$first" >/dev/null)
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" block "$first" --by "$first" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "self dependency should fail"
+  assert_contains "$output" "task cannot block itself"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" block "$first" --by "$second" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "cycle dependency should fail"
+  assert_contains "$output" "dependency would create a cycle"
+  pass "self-dependency and dependency cycles are rejected"
+}
+
 test_release_clears_claim_fields() {
   local repo add_output id count status
   repo="$TEST_DIR/release-clears"
@@ -639,6 +722,10 @@ test_claim_next_ignores_done_and_review
 test_claim_next_reclaims_expired_task
 test_claim_next_second_attempt_fails_cleanly
 test_claim_next_prompt_lifecycle
+test_dependencies_skip_blocked_tasks
+test_dependencies_unblocked_task_becomes_claimable
+test_done_blocker_allows_dependent_task
+test_dependency_rejects_self_and_cycle
 test_release_clears_claim_fields
 test_files_globs_are_preserved_literally
 test_update_status_creates_state_db

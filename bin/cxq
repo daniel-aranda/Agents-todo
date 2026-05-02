@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CXQ_VERSION="0.1.1"
-CXQ_REPO_SCHEMA_VERSION="1"
+CXQ_REPO_SCHEMA_VERSION="2"
 CXQ_DEFAULT_REMOTE_URL="https://github.com/daniel-aranda/Agents-todo.git"
 
 die() {
@@ -25,6 +25,9 @@ Usage:
   cxq show <id>
   cxq claim <id> [--agent <name>] [--lease <duration>]
   cxq claim-next [--agent <name>] [--lease <duration>] [--format id|md|prompt]
+  cxq block <id> --by <blocker-id>
+  cxq deps <id>
+  cxq unblock <id> --by <blocker-id>
   cxq note <id> <note>
   cxq prompt <id>
   cxq review <id> --summary <summary>
@@ -46,6 +49,8 @@ Examples:
   cxq install
   cxq update --status
   cxq add "Fix flaky auth refresh test" --priority 80 --files "src/auth,tests/auth"
+  cxq block 42 --by 17
+  cxq deps 42
   cxq next --format md
   cxq claim-next --agent codex --lease 2h --format prompt
 EOF
@@ -224,18 +229,29 @@ CREATE TABLE IF NOT EXISTS task_events (
 CREATE INDEX IF NOT EXISTS idx_task_events_task_created
 ON task_events(task_id, created_at);
 
+CREATE TABLE IF NOT EXISTS task_dependencies (
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  blocker_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (task_id, blocker_task_id),
+  CHECK (task_id <> blocker_task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_blocker
+ON task_dependencies(blocker_task_id);
+
 CREATE TABLE IF NOT EXISTS cxq_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 
 INSERT OR IGNORE INTO cxq_meta (key, value)
-VALUES ('schema_version', '1');
+VALUES ('schema_version', '2');
 
 UPDATE cxq_meta
-SET value = '1'
+SET value = '2'
 WHERE key = 'schema_version'
-  AND CAST(value AS INTEGER) < 1;
+  AND CAST(value AS INTEGER) < 2;
 
 CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
 AFTER UPDATE ON tasks
@@ -284,6 +300,9 @@ Before starting queued work:
 If `cxq` exits with update-required, run:
 `cxq update --all --yes`
 then retry the original command.
+
+Tasks may depend on other tasks. Use `cxq deps <id>` to inspect blockers and
+do not claim tasks whose blockers are not done.
 
 Never mark a task `done` unless explicitly instructed.
 EOF
@@ -727,6 +746,32 @@ print_json_array_md() {
   fi
 }
 
+render_task_dependencies() {
+  local db=$1
+  local id=$2
+  local blockers blocks
+
+  blockers=$(sqlite3 -batch -noheader "$db" "SELECT '- #' || t.id || ' [' || t.status || '] ' || t.title FROM task_dependencies td JOIN tasks t ON t.id = td.blocker_task_id WHERE td.task_id = $id ORDER BY t.status <> 'done' DESC, t.priority DESC, t.id ASC;")
+  blocks=$(sqlite3 -batch -noheader "$db" "SELECT '- #' || t.id || ' [' || t.status || '] ' || t.title FROM task_dependencies td JOIN tasks t ON t.id = td.task_id WHERE td.blocker_task_id = $id ORDER BY t.status <> 'done' DESC, t.priority DESC, t.id ASC;")
+
+  printf '## Dependencies\n'
+  printf 'Blocked by:\n'
+  if [ -n "$blockers" ]; then
+    printf '%s\n' "$blockers"
+  else
+    printf 'None\n'
+  fi
+  printf '\n'
+
+  printf 'Blocks:\n'
+  if [ -n "$blocks" ]; then
+    printf '%s\n' "$blocks"
+  else
+    printf 'None\n'
+  fi
+  printf '\n'
+}
+
 render_task_core() {
   local db=$1
   local id=$2
@@ -764,6 +809,8 @@ render_task_core() {
   printf '## Tags\n'
   print_json_array_md "$db" "$id" "tags_json"
   printf '\n'
+
+  render_task_dependencies "$db" "$id"
 
   printf '## Acceptance criteria\n'
   if [ -n "$acceptance" ]; then
@@ -855,6 +902,23 @@ task_exists() {
   [ "$count" = "1" ]
 }
 
+task_has_open_blockers() {
+  local db=$1
+  local id=$2
+  local count
+  count=$(sqlite_value "$db" "SELECT COUNT(*) FROM task_dependencies td JOIN tasks blocker ON blocker.id = td.blocker_task_id WHERE td.task_id = $id AND blocker.status <> 'done';")
+  [ "$count" != "0" ]
+}
+
+dependency_would_cycle() {
+  local db=$1
+  local task_id=$2
+  local blocker_id=$3
+  local count
+  count=$(sqlite_value "$db" "WITH RECURSIVE dependency_chain(id) AS (SELECT blocker_task_id FROM task_dependencies WHERE task_id = $blocker_id UNION SELECT td.blocker_task_id FROM task_dependencies td JOIN dependency_chain dc ON td.task_id = dc.id) SELECT COUNT(*) FROM dependency_chain WHERE id = $task_id;")
+  [ "$count" != "0" ]
+}
+
 require_task_id() {
   local id=${1-}
   [[ "$id" =~ ^[0-9]+$ ]] || die "task id must be an integer."
@@ -927,7 +991,7 @@ cmd_next() {
 
   local db id
   db=$(db_path_or_die)
-  id=$(sqlite_value "$db" "SELECT id FROM tasks WHERE status = 'ready' AND deps_json = '[]' ORDER BY priority DESC, created_at ASC LIMIT 1;")
+  id=$(sqlite_value "$db" "SELECT id FROM tasks candidate WHERE status = 'ready' AND NOT EXISTS (SELECT 1 FROM task_dependencies td JOIN tasks blocker ON blocker.id = td.blocker_task_id WHERE td.task_id = candidate.id AND blocker.status <> 'done') ORDER BY priority DESC, created_at ASC LIMIT 1;")
   if [ -z "$id" ]; then
     printf 'No ready tasks.\n' >&2
     exit 1
@@ -949,6 +1013,102 @@ cmd_show() {
   db=$(db_path_or_die)
   task_exists "$db" "$id" || die "task not found: $id"
   render_task_show "$db" "$id"
+}
+
+cmd_block() {
+  require_sqlite3
+  [ "$#" -ge 1 ] || die "usage: cxq block <id> --by <blocker-id>"
+
+  local id=$1 blocker_id="" db actor changed
+  require_task_id "$id"
+  shift
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --by)
+        [ "$#" -ge 2 ] || die "--by requires a task id."
+        blocker_id=$2
+        require_task_id "$blocker_id"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown block option: $1"
+        ;;
+    esac
+  done
+
+  [ -n "$blocker_id" ] || die "blocker task id is required."
+  [ "$id" != "$blocker_id" ] || die "task cannot block itself."
+
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  task_exists "$db" "$blocker_id" || die "blocker task not found: $blocker_id"
+  if dependency_would_cycle "$db" "$id" "$blocker_id"; then
+    die "dependency would create a cycle."
+  fi
+
+  changed=$(sqlite_value "$db" "INSERT OR IGNORE INTO task_dependencies (task_id, blocker_task_id) VALUES ($id, $blocker_id); SELECT changes();")
+  actor=$(current_actor)
+  if [ "$changed" = "1" ]; then
+    log_event "$db" "$id" "blocked_by" "$actor" "blocked by #$blocker_id"
+  fi
+  printf 'Task #%s is blocked by #%s\n' "$id" "$blocker_id"
+}
+
+cmd_deps() {
+  require_sqlite3
+  [ "$#" -eq 1 ] || die "usage: cxq deps <id>"
+
+  local id=$1 db
+  require_task_id "$id"
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  printf '# Dependencies for task #%s\n\n' "$id"
+  render_task_dependencies "$db" "$id"
+}
+
+cmd_unblock() {
+  require_sqlite3
+  [ "$#" -ge 1 ] || die "usage: cxq unblock <id> --by <blocker-id>"
+
+  local id=$1 blocker_id="" db actor changed
+  require_task_id "$id"
+  shift
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --by)
+        [ "$#" -ge 2 ] || die "--by requires a task id."
+        blocker_id=$2
+        require_task_id "$blocker_id"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown unblock option: $1"
+        ;;
+    esac
+  done
+
+  [ -n "$blocker_id" ] || die "blocker task id is required."
+
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  task_exists "$db" "$blocker_id" || die "blocker task not found: $blocker_id"
+  changed=$(sqlite_value "$db" "DELETE FROM task_dependencies WHERE task_id = $id AND blocker_task_id = $blocker_id; SELECT changes();")
+  if [ "$changed" = "0" ]; then
+    die "task $id is not blocked by $blocker_id."
+  fi
+  actor=$(current_actor)
+  log_event "$db" "$id" "unblocked_by" "$actor" "removed blocker #$blocker_id"
+  printf 'Task #%s is no longer blocked by #%s\n' "$id" "$blocker_id"
 }
 
 lease_modifier() {
@@ -999,7 +1159,7 @@ cmd_claim() {
   task_exists "$db" "$id" || die "task not found: $id"
   modifier=$(lease_modifier "$lease")
 
-  changed=$(sqlite_value "$db" "UPDATE tasks SET status = 'claimed', claimed_by = $(sql_quote "$agent"), claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', $(sql_quote "$modifier")) WHERE id = $id AND (status IN ('ready', 'inbox') OR (status = 'claimed' AND lease_until IS NOT NULL AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))); SELECT changes();")
+  changed=$(sqlite_value "$db" "UPDATE tasks SET status = 'claimed', claimed_by = $(sql_quote "$agent"), claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), lease_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', $(sql_quote "$modifier")) WHERE id = $id AND (status IN ('ready', 'inbox') OR (status = 'claimed' AND lease_until IS NOT NULL AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))) AND NOT EXISTS (SELECT 1 FROM task_dependencies td JOIN tasks blocker ON blocker.id = td.blocker_task_id WHERE td.task_id = tasks.id AND blocker.status <> 'done'); SELECT changes();")
   if [ "$changed" = "0" ]; then
     die "task $id is not available to claim."
   fi
@@ -1052,13 +1212,21 @@ BEGIN IMMEDIATE;
 CREATE TEMP TABLE cxq_claim_next_selection (id INTEGER PRIMARY KEY);
 INSERT INTO cxq_claim_next_selection (id)
 SELECT id
-FROM tasks
-WHERE status = 'ready'
-   OR (
+FROM tasks candidate
+WHERE (
+    status = 'ready'
+    OR (
     status = 'claimed'
     AND lease_until IS NOT NULL
     AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-   )
+   ))
+  AND NOT EXISTS (
+    SELECT 1
+    FROM task_dependencies td
+    JOIN tasks blocker ON blocker.id = td.blocker_task_id
+    WHERE td.task_id = candidate.id
+      AND blocker.status <> 'done'
+  )
 ORDER BY priority DESC, created_at ASC
 LIMIT 1;
 UPDATE tasks
@@ -1370,7 +1538,7 @@ EOF
 
 command_uses_update_gate() {
   case "${1:-}" in
-    add|list|ls|next|show|claim|claim-next|note|prompt|review|done|repo|stale|release) return 0 ;;
+    add|list|ls|next|show|claim|claim-next|block|deps|unblock|note|prompt|review|done|repo|stale|release) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1522,6 +1690,18 @@ main() {
     claim-next)
       shift
       cmd_claim_next "$@"
+      ;;
+    block)
+      shift
+      cmd_block "$@"
+      ;;
+    deps)
+      shift
+      cmd_deps "$@"
+      ;;
+    unblock)
+      shift
+      cmd_unblock "$@"
       ;;
     note)
       shift

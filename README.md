@@ -176,6 +176,9 @@ cxq next
 cxq show 42
 cxq claim 42 --agent codex --lease 2h
 cxq claim-next --agent codex --lease 2h --format prompt
+cxq block 42 --by 17
+cxq deps 42
+cxq unblock 42 --by 17
 cxq note 42 "Found race in token refresh path"
 cxq prompt 42
 cxq review 42 --summary "Implemented lock and added regression test"
@@ -223,6 +226,20 @@ cxq claim-next --agent codex --lease 2h --format prompt
 `cxq prompt 42` renders a deterministic agent prompt with the task body, tags,
 allowed paths, acceptance criteria, verification command, recent events, result
 summary when present, and finishing instructions.
+
+## Dependencies
+
+Tasks can be blocked by other tasks:
+
+```sh
+cxq block 42 --by 17
+cxq deps 42
+cxq unblock 42 --by 17
+```
+
+`cxq claim-next` and `cxq next` skip tasks with blockers that are not `done`.
+Once every blocker is `done`, the dependent task becomes claimable again while
+preserving normal priority ordering. Self-dependencies and cycles are rejected.
 
 ## Task statuses
 
@@ -346,6 +363,9 @@ Core fields:
 - `result_summary`
 - `transcript_path`
 - timestamps
+
+Task dependencies are stored in `task_dependencies`, not in the legacy
+`deps_json` field.
 
 SQLite WAL mode should be enabled so local reads and writes behave well when a
 human, watcher, or agent touches the queue.
