@@ -8,7 +8,7 @@ PREFIX="$TEST_DIR/prefix"
 CXQ="$PREFIX/bin/cxq"
 PASS=0
 export HOME="$TEST_DIR/home"
-export CXQ_TEST_LATEST_VERSION="v0.1.1"
+export CXQ_TEST_LATEST_VERSION="v0.2.0"
 export CXQ_NOW_EPOCH="1000000"
 
 mkdir -p "$HOME"
@@ -88,7 +88,7 @@ test_installer_and_version() {
   [ "$(state_get "install_source_dir")" = "$ROOT" ] || fail "installer should record install_source_dir"
   local output
   output=$("$CXQ" -v)
-  assert_contains "$output" "cxq 0.1.1" "cxq -v prints version"
+  assert_contains "$output" "cxq 0.2.0" "cxq -v prints version"
   pass "installer creates a working cxq command"
 }
 
@@ -468,7 +468,7 @@ test_update_status_creates_state_db() {
   rm -rf "$HOME/.cxq"
   output=$("$CXQ" update --status)
   assert_file "$HOME/.cxq/state.db"
-  assert_contains "$output" "current_version: 0.1.1"
+  assert_contains "$output" "current_version: 0.2.0"
   assert_contains "$output" "update_required: 0"
   pass "update status creates and reports global state"
 }
@@ -496,7 +496,7 @@ test_update_check_runs_after_24h() {
   state_set "last_update_check_at" "1000"
   state_set "last_update_check_result" "old-result"
 
-  (cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION=v0.1.1 "$CXQ" list >/dev/null)
+  (cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION=v0.2.0 "$CXQ" list >/dev/null)
   result=$(state_get "last_update_check_result")
   checked_at=$(state_get "last_update_check_at")
   assert_contains "$result" "up-to-date"
@@ -510,11 +510,11 @@ test_latest_version_marks_update_required() {
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
 
-  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v0.1.2 "$CXQ" update --check)
-  assert_contains "$output" "update-available: v0.1.2"
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v0.2.1 "$CXQ" update --check)
+  assert_contains "$output" "update-available: v0.2.1"
   [ "$(state_get "update_required")" = "1" ] || fail "newer latest version should mark update required"
   [ "$(state_get "update_required_kind")" = "self" ] || fail "newer latest version should require self update"
-  [ "$(state_get "latest_version")" = "v0.1.2" ] || fail "latest version should be recorded"
+  [ "$(state_get "latest_version")" = "v0.2.1" ] || fail "latest version should be recorded"
   pass "newer latest version marks self update required"
 }
 
@@ -626,8 +626,8 @@ test_update_check_command() {
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
 
-  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v0.1.1 "$CXQ" update --check)
-  assert_contains "$output" "up-to-date: v0.1.1"
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v0.2.0 "$CXQ" update --check)
+  assert_contains "$output" "up-to-date: v0.2.0"
   assert_contains "$output" "No update required."
   pass "update --check records remote check result"
 }
