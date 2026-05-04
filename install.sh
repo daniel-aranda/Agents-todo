@@ -198,13 +198,15 @@ print_manual_path_instructions() {
 
 split_path_find_cxq() {
   local old_ifs=$IFS
+  local path_entries=()
   local dir
   local path_entry
 
   IFS=:
-  for path_entry in $PATH; do
-    IFS=$old_ifs
+  read -r -a path_entries <<< "$PATH"
+  IFS=$old_ifs
 
+  for path_entry in "${path_entries[@]}"; do
     if [ -z "$path_entry" ]; then
       path_entry="."
     fi
@@ -213,11 +215,7 @@ split_path_find_cxq() {
       dir=$(cd "$path_entry" 2>/dev/null && pwd -P || printf '%s' "$path_entry")
       printf '%s/cxq\n' "$dir"
     fi
-
-    IFS=:
   done
-
-  IFS=$old_ifs
 }
 
 first_cxq_on_path() {
@@ -260,11 +258,17 @@ warn_path_resolution() {
 warn_old_binaries() {
   local install_dir=$1
   local target=$2
+  local old_ifs=$IFS
   local dirs old
+  local old_dirs=()
 
-  dirs=${CXQ_OLD_BIN_DIRS:-"/opt/homebrew/bin /usr/local/bin"}
+  dirs=${CXQ_OLD_BIN_DIRS:-"/opt/homebrew/bin:/usr/local/bin"}
+  IFS=:
+  read -r -a old_dirs <<< "$dirs"
+  IFS=$old_ifs
 
-  for old in $dirs; do
+  for old in "${old_dirs[@]}"; do
+    [ -n "$old" ] || continue
     if [ -x "$old/cxq" ] && [ "$old/cxq" != "$target" ]; then
       printf '\nWarning: found another cxq at %s\n' "$old/cxq"
 

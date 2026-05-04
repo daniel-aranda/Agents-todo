@@ -92,6 +92,15 @@ run_source_fixture() {
   git -C "$repo" commit -q -m "fixture"
 }
 
+attach_source_fixture_upstream() {
+  local repo=$1
+  local remote=$2
+  git init --bare -q "$remote"
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -q -u origin main
+  git --git-dir="$remote" symbolic-ref HEAD refs/heads/main
+}
+
 fixture_version() {
   local repo=$1
   local line
@@ -158,6 +167,25 @@ test_installer_explicit_prefix_and_old_binary_warning() {
   output=$(CXQ_OLD_BIN_DIRS="$old" "$ROOT/install.sh")
   assert_contains "$output" "Warning: found another cxq at $old/cxq"
   pass "installer supports explicit prefix and warns about old PATH binaries"
+}
+
+test_installer_path_scanning_preserves_literal_paths() {
+  local prefix literal_path expanded_path spaced_old output
+  prefix="$TEST_DIR/path-scan-prefix"
+  literal_path="$TEST_DIR/path-star-*"
+  expanded_path="$TEST_DIR/path-star-expanded"
+  spaced_old="$TEST_DIR/old bin with space"
+
+  mkdir -p "$literal_path" "$expanded_path" "$spaced_old"
+  printf '#!/usr/bin/env bash\nprintf expanded\\n\n' >"$expanded_path/cxq"
+  chmod +x "$expanded_path/cxq"
+  printf '#!/usr/bin/env bash\nprintf old\\n\n' >"$spaced_old/cxq"
+  chmod +x "$spaced_old/cxq"
+
+  output=$(PATH="$literal_path:/usr/bin:/bin" CXQ_OLD_BIN_DIRS="$spaced_old" "$ROOT/install.sh" --prefix "$prefix" --no-modify-profile)
+  assert_not_contains "$output" "$expanded_path/cxq" "PATH scanner should not expand glob-like entries"
+  assert_contains "$output" "Warning: found another cxq at $spaced_old/cxq"
+  pass "installer PATH scanning preserves literal paths"
 }
 
 test_install_rejects_non_git_directory() {
@@ -541,6 +569,34 @@ test_update_status_creates_state_db() {
   pass "update status creates and reports global state"
 }
 
+test_doctor_reports_state_and_is_read_only() {
+  local repo output
+  repo="$TEST_DIR/doctor-repo"
+  run_git_init "$repo"
+
+  state_set "update_required" "1"
+  state_set "update_required_kind" "self"
+  state_set "update_required_reason" "doctor test"
+
+  output=$(cd "$repo" && "$CXQ" doctor)
+  assert_contains "$output" "current_version: $(current_repo_version)"
+  assert_contains "$output" "selected_binary:"
+  assert_contains "$output" "git: ok"
+  assert_contains "$output" "sqlite3: ok"
+  assert_contains "$output" "update_required: 1"
+  assert_contains "$output" "repo_queue_installed: no"
+  assert_not_exists "$repo/.codex"
+
+  (cd "$repo" && CXQ_NO_UPDATE_CHECK=1 "$CXQ" install >/dev/null)
+  output=$(cd "$repo" && "$CXQ" doctor)
+  assert_contains "$output" "repo_queue_installed: yes"
+  assert_contains "$output" "repo_update_required: no"
+  state_set "update_required" "0"
+  state_set "update_required_kind" ""
+  state_set "update_required_reason" ""
+  pass "doctor reports state and does not repair repos"
+}
+
 test_update_check_skips_before_24h() {
   local repo result
   repo="$TEST_DIR/update-skip-before-24h"
@@ -904,6 +960,7 @@ test_release_prepare_and_dry_runs() {
   local repo version notes output status
   repo="$TEST_DIR/release-prepare"
   run_source_fixture "$repo"
+  attach_source_fixture_upstream "$repo" "$TEST_DIR/release-prepare-origin.git"
   version=$(fixture_version "$repo")
   notes="/tmp/cxq-release-v$version.md"
   rm -f "$notes"
@@ -921,6 +978,61 @@ test_release_prepare_and_dry_runs() {
   output=$(cd "$repo" && "$CXQ" release "$version" --dry-run)
   assert_contains "$output" "Dry run: would prepare, tag, and publish cxq v$version."
   pass "release prepare and dry-run commands work"
+}
+
+test_release_tag_checks_upstream_state() {
+  local repo remote work version output status
+
+  repo="$TEST_DIR/release-no-upstream"
+  run_source_fixture "$repo"
+  version=$(fixture_version "$repo")
+  set +e
+  output=$(cd "$repo" && "$CXQ" release tag "$version" --dry-run --skip-tests 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "release tag should fail without upstream"
+  assert_contains "$output" "main must track an upstream"
+
+  repo="$TEST_DIR/release-up-to-date"
+  remote="$TEST_DIR/release-up-to-date-origin.git"
+  run_source_fixture "$repo"
+  attach_source_fixture_upstream "$repo" "$remote"
+  version=$(fixture_version "$repo")
+  output=$(cd "$repo" && "$CXQ" release tag "$version" --dry-run --skip-tests)
+  assert_contains "$output" "Dry run: would create and push tag v$version."
+
+  repo="$TEST_DIR/release-behind"
+  remote="$TEST_DIR/release-behind-origin.git"
+  work="$TEST_DIR/release-behind-work"
+  run_source_fixture "$repo"
+  attach_source_fixture_upstream "$repo" "$remote"
+  version=$(fixture_version "$repo")
+  git clone -q "$remote" "$work"
+  git -C "$work" config user.email test@example.com
+  git -C "$work" config user.name "cxq test"
+  printf 'remote\n' >"$work/remote.txt"
+  git -C "$work" add remote.txt
+  git -C "$work" commit -q -m "remote advance"
+  git -C "$work" push -q origin main
+  git -C "$repo" fetch -q origin
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" release tag "$version" --dry-run --skip-tests 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "release tag should fail when local main is behind"
+  assert_contains "$output" "local main is behind"
+
+  printf 'local\n' >"$repo/local.txt"
+  git -C "$repo" add local.txt
+  git -C "$repo" commit -q -m "local advance"
+  set +e
+  output=$(cd "$repo" && "$CXQ" release tag "$version" --dry-run --skip-tests 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "release tag should fail when local main diverged"
+  assert_contains "$output" "local main has diverged"
+  pass "release tag checks upstream state"
 }
 
 test_release_prepare_rejects_mismatch_and_existing_tag() {
@@ -986,6 +1098,7 @@ test_commands_work_from_repo_subdirectory_after_install() {
 test_installer_and_version
 test_installer_defaults_to_home_local
 test_installer_explicit_prefix_and_old_binary_warning
+test_installer_path_scanning_preserves_literal_paths
 test_install_rejects_non_git_directory
 test_install_rejects_git_subdirectory
 test_project_install_creates_files
@@ -1004,6 +1117,7 @@ test_dependency_rejects_self_and_cycle
 test_release_clears_claim_fields
 test_files_globs_are_preserved_literally
 test_update_status_creates_state_db
+test_doctor_reports_state_and_is_read_only
 test_update_check_skips_before_24h
 test_update_check_runs_after_24h
 test_latest_version_marks_update_required
@@ -1026,6 +1140,7 @@ test_repeated_update_gate_does_not_loop
 test_version_bump_and_set_commands
 test_version_invalid_and_outside_repo
 test_release_prepare_and_dry_runs
+test_release_tag_checks_upstream_state
 test_release_prepare_rejects_mismatch_and_existing_tag
 test_release_publish_requires_yes_noninteractive_and_source_repo
 test_commands_work_from_repo_subdirectory_after_install

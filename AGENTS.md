@@ -188,30 +188,11 @@ Use short, practical release notes.
 
 Good structure:
 
-~~~md
-## cxq vX.Y.Z
-
-Short summary.
-
-### Highlights
-
-- Change one
-- Change two
-- Change three
-
-### Update
-
-~~~sh
-git pull --ff-only origin main
-./install.sh
-cxq version
-cxq update --status
-~~~
-
-### Notes
-
-Any caveats.
-~~~
+- `## cxq vX.Y.Z`
+- short summary
+- `### Highlights` with practical bullets
+- `### Update` with a `~~~sh` fenced command block
+- `### Notes` for caveats
 
 When writing Markdown that contains code fences, prefer `~~~` fences to avoid nested Markdown breakage.
 

@@ -93,14 +93,14 @@ The project is designed for people who clone this repository, run
 `install.sh`, and then use the installed `cxq` command from other local Git
 projects.
 
-By default, `install.sh` installs to the first writable known macOS bin
-directory that is already on `PATH`, checking `/usr/local/bin`,
-`/opt/homebrew/bin`, and `$HOME/.local/bin`. If none of those work, it installs
-to `$HOME/.local/bin` and prints the `PATH` update needed for your shell.
+By default, `install.sh` installs to `$HOME/.local/bin`. If that directory is
+not already on `PATH`, the installer prints the shell profile update needed for
+your shell.
 
 You can choose a prefix explicitly:
 
 ~~~sh
+PREFIX=/opt/homebrew ./install.sh
 ./install.sh --prefix "$HOME/.local"
 ~~~
 
@@ -165,6 +165,7 @@ The current version of `cxq` is intentionally small:
 ~~~sh
 cxq -v
 cxq version --plain
+cxq doctor
 cxq install
 cxq update
 cxq update --status
@@ -189,6 +190,9 @@ cxq repo 42
 cxq stale
 cxq release 42
 ~~~
+
+`cxq doctor` is read-only. It reports the installed version, PATH resolution,
+required tools, install metadata, update state, and current repo queue setup.
 
 The default workflow is:
 
@@ -335,11 +339,12 @@ cxq release 0.2.1
 ~~~
 
 `cxq release prepare` verifies the requested version and writes release notes to
-`/tmp/cxq-release-vX.Y.Z.md`. `cxq release tag` creates and pushes the Git tag.
-`cxq release publish` requires `gh` and publishes the GitHub release. The full
-`cxq release X.Y.Z` path asks before publishing interactively and requires
-`--yes` when non-interactive. Use `--dry-run` to print actions without changing
-Git or GitHub.
+`/tmp/cxq-release-vX.Y.Z.md`. `cxq release tag` creates and pushes the Git tag;
+it must run from `main` with an up-to-date upstream. `cxq release publish`
+requires `gh` and publishes the GitHub release. The full `cxq release X.Y.Z`
+path asks before publishing interactively and requires `--yes` when
+non-interactive. Use `--dry-run` to print actions without changing Git or
+GitHub.
 
 ## Agent contract
 

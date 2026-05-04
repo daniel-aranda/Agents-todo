@@ -20,6 +20,7 @@ Usage:
   cxq version bump patch|minor|major
   cxq version set X.Y.Z
   cxq help
+  cxq doctor
   cxq install
   cxq update [--yes]
   cxq update --status|--check|--self|--repo|--all [--yes]
@@ -1559,6 +1560,32 @@ release_check_tag_available() {
   fi
 }
 
+release_verify_main_ready() {
+  local branch upstream counts ahead behind
+
+  branch=$(git branch --show-current)
+  [ "$branch" = "main" ] || die "release tags must be created from main."
+
+  upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+  [ -n "$upstream" ] || die "main must track an upstream before release tagging."
+  git rev-parse -q --verify "$upstream" >/dev/null || die "upstream $upstream is not available; fetch before releasing."
+
+  counts=$(git rev-list --left-right --count HEAD..."$upstream")
+  set -- $counts
+  ahead=${1:-0}
+  behind=${2:-0}
+
+  if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+    die "local main has diverged from $upstream; sync before releasing."
+  fi
+  if [ "$behind" -gt 0 ]; then
+    die "local main is behind $upstream; pull before releasing."
+  fi
+  if [ "$ahead" -gt 0 ]; then
+    die "local main has unpushed commits relative to $upstream; push before releasing."
+  fi
+}
+
 release_run_tests() {
   local skip_tests=$1
   if [ "$skip_tests" -eq 1 ]; then
@@ -1615,11 +1642,10 @@ cmd_release_tag() {
   local version=$1
   local skip_tests=${2:-0}
   local dry_run=${3:-0}
-  local root branch
+  local root
   root=$(source_repo_root_or_die)
   release_verify_version "$root" "$version"
-  branch=$(git branch --show-current)
-  [ "$branch" = "main" ] || die "release tags must be created from main."
+  release_verify_main_ready
   release_check_tag_available "$version"
   release_run_tests "$skip_tests"
 
@@ -1674,6 +1700,8 @@ cmd_release_workflow() {
   if [ "$dry_run" -eq 1 ]; then
     source_repo_root_or_die >/dev/null
     release_verify_version "$(source_repo_root_or_die)" "$version"
+    release_verify_main_ready
+    release_check_tag_available "$version"
     printf 'Dry run: would prepare, tag, and publish cxq v%s.\n' "$version"
     return
   fi
@@ -1764,6 +1792,99 @@ print_update_status() {
     printf 'update_required_since: %s (%s)\n' "$since" "$(format_epoch "$since")"
   fi
   printf 'last_update_check_result: %s\n' "${result:-none}"
+}
+
+current_executable_path() {
+  local dir base found
+
+  case "$0" in
+    */*)
+      dir=$(dirname "$0")
+      base=$(basename "$0")
+      dir=$(physical_path "$dir" 2>/dev/null || printf '%s' "$dir")
+      printf '%s/%s' "$dir" "$base"
+      ;;
+    *)
+      found=$(command -v "$0" 2>/dev/null || true)
+      printf '%s' "${found:-$0}"
+      ;;
+  esac
+}
+
+cmd_doctor() {
+  local selected running git_status sqlite_status
+  local install_source install_bin install_remote required kind reason
+  local root repo_reason queue_installed
+
+  selected=$(command -v cxq 2>/dev/null || true)
+  running=$(current_executable_path)
+
+  if command -v git >/dev/null 2>&1; then
+    git_status="ok ($(command -v git))"
+  else
+    git_status="missing"
+  fi
+
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite_status="ok ($(command -v sqlite3))"
+    init_state_db
+    install_source=$(state_get "install_source_dir")
+    install_bin=$(state_get "install_bin_path")
+    install_remote=$(state_get "install_remote_url")
+    required=$(state_get "update_required")
+    kind=$(state_get "update_required_kind")
+    reason=$(state_get "update_required_reason")
+  else
+    sqlite_status="missing"
+    install_source=""
+    install_bin=""
+    install_remote=""
+    required=""
+    kind=""
+    reason=""
+  fi
+
+  printf '# cxq doctor\n\n'
+  printf 'current_version: %s\n' "$CXQ_VERSION"
+  printf 'running_script: %s\n' "${running:-unknown}"
+  printf 'selected_binary: %s\n' "${selected:-not found on PATH}"
+  printf 'git: %s\n' "$git_status"
+  printf 'sqlite3: %s\n' "$sqlite_status"
+  printf 'install_source_dir: %s\n' "${install_source:-unknown}"
+  printf 'install_bin_path: %s\n' "${install_bin:-unknown}"
+  printf 'install_remote_url: %s\n' "${install_remote:-unknown}"
+  printf 'update_required: %s\n' "${required:-0}"
+  printf 'update_required_kind: %s\n' "${kind:-none}"
+  printf 'update_required_reason: %s\n' "${reason:-none}"
+
+  root=$(git_root 2>/dev/null || true)
+  if [ -z "$root" ]; then
+    printf 'git_repo: no\n'
+    return 0
+  fi
+
+  root=$(physical_path "$root")
+  printf 'git_repo: %s\n' "$root"
+
+  if [ -f "$root/.codex/tasks.db" ]; then
+    queue_installed="yes"
+  else
+    queue_installed="no"
+  fi
+  printf 'repo_queue_installed: %s\n' "$queue_installed"
+
+  if command -v sqlite3 >/dev/null 2>&1; then
+    repo_reason=$(repo_update_reason "$root" || true)
+    if [ -n "$repo_reason" ]; then
+      printf 'repo_update_required: yes\n'
+      printf 'repo_update_reason: %s\n' "$repo_reason"
+    else
+      printf 'repo_update_required: no\n'
+    fi
+  else
+    printf 'repo_update_required: unknown\n'
+    printf 'repo_update_reason: sqlite3 missing\n'
+  fi
 }
 
 cmd_update_check() {
@@ -2073,7 +2194,9 @@ main() {
       cmd_update "$@"
       ;;
     doctor)
-      printf 'cxq doctor: no checks implemented yet.\n'
+      shift
+      [ "$#" -eq 0 ] || die "doctor does not accept arguments."
+      cmd_doctor
       ;;
     add)
       shift
