@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CXQ_VERSION="0.2.3"
-CXQ_REPO_SCHEMA_VERSION="2"
+CXQ_VERSION="0.3.0-dev"
+CXQ_REPO_SCHEMA_VERSION="3"
 CXQ_DEFAULT_REMOTE_URL="https://github.com/daniel-aranda/Agents-todo.git"
+CXQ_SQLITE_BUSY_TIMEOUT_MS="${CXQ_SQLITE_BUSY_TIMEOUT_MS:-5000}"
+CXQ_SQLITE_MAX_ATTEMPTS="${CXQ_SQLITE_MAX_ATTEMPTS:-5}"
 
 die() {
   printf 'cxq: %s\n' "$*" >&2
@@ -27,7 +29,7 @@ Usage:
   cxq release prepare|tag|publish X.Y.Z
   cxq release X.Y.Z [--yes|--dry-run]
   cxq add <title> [options]
-  cxq list [--all] [--status <status>]
+  cxq list [--all] [--status <status>] [--needs-action] [--questions]
   cxq next [--format text|id|md]
   cxq show <id>
   cxq claim <id> [--agent <name>] [--lease <duration>]
@@ -38,7 +40,14 @@ Usage:
   cxq note <id> <note>
   cxq prompt <id>
   cxq review <id> --summary <summary>
-  cxq done <id> [--summary <summary>]
+  cxq reopen <id> [--to ready|inbox|blocked] --reason <reason>
+  cxq followup <id> <title> [--close] [add options]
+  cxq finding add <id> --severity <level> --note <note> [--followup <id>]
+  cxq finding list <id>
+  cxq finding resolve <finding-id> [--status accepted|resolved]
+  cxq review-stale [--older-than 24h]
+  cxq status-transitions
+  cxq done <id> [--summary <summary>] [--force]
   cxq repo <id>
   cxq stale
   cxq release <id>
@@ -269,24 +278,53 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
 CREATE INDEX IF NOT EXISTS idx_task_dependencies_blocker
 ON task_dependencies(blocker_task_id);
 
+CREATE TABLE IF NOT EXISTS task_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+
+  severity TEXT NOT NULL DEFAULT 'medium'
+    CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+
+  status TEXT NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open', 'accepted', 'resolved')),
+
+  note TEXT NOT NULL DEFAULT '',
+  followup_task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_findings_task_status
+ON task_findings(task_id, status);
+
 CREATE TABLE IF NOT EXISTS cxq_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 
 INSERT OR IGNORE INTO cxq_meta (key, value)
-VALUES ('schema_version', '2');
+VALUES ('schema_version', '3');
 
 UPDATE cxq_meta
-SET value = '2'
+SET value = '3'
 WHERE key = 'schema_version'
-  AND CAST(value AS INTEGER) < 2;
+  AND CAST(value AS INTEGER) < 3;
 
 CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
 AFTER UPDATE ON tasks
 FOR EACH ROW
 BEGIN
   UPDATE tasks
+  SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  WHERE id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_task_findings_updated_at
+AFTER UPDATE ON task_findings
+FOR EACH ROW
+BEGIN
+  UPDATE task_findings
   SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   WHERE id = OLD.id;
 END;
@@ -333,20 +371,92 @@ then retry the original command.
 Tasks may depend on other tasks. Use `cxq deps <id>` to inspect blockers and
 do not claim tasks whose blockers are not done.
 
+Prefix questions in notes with `DUDA:` or `BLOCKER:` so they show up in
+`cxq list --questions`.
+
+Record review caveats with `cxq finding add <id> --severity ... --note "..."`
+instead of burying them in the summary.
+
+A human sends work back with `cxq reopen <id> --reason "..."` and splits
+leftover work with `cxq followup <id> "..."`. Run `cxq status-transitions` to
+see which movements are supported.
+
 Never mark a task `done` unless explicitly instructed.
 EOF
+}
+
+sqlite_error_is_transient() {
+  case "${1-}" in
+    *"database is locked"*) return 0 ;;
+    *"database table is locked"*) return 0 ;;
+    *"database schema is locked"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+sqlite_backoff() {
+  local attempt=$1
+  local seconds
+  case "$attempt" in
+    1) seconds="0.1" ;;
+    2) seconds="0.25" ;;
+    3) seconds="0.5" ;;
+    *) seconds="1" ;;
+  esac
+  sleep "$seconds" 2>/dev/null || sleep 1
+}
+
+# Runs sqlite3 with a busy timeout and retries transient lock failures.
+# Usage: sqlite_run <db> <sql> [extra sqlite3 flags...]
+sqlite_run() {
+  local db=$1
+  local sql=$2
+  shift 2
+
+  local attempt=1 output status
+  while :; do
+    set +e
+    output=$(sqlite3 -batch -cmd ".timeout $CXQ_SQLITE_BUSY_TIMEOUT_MS" "$@" "$db" "$sql" 2>&1)
+    status=$?
+    set -e
+
+    if [ "$status" -eq 0 ]; then
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+    fi
+
+    if [ "$attempt" -ge "$CXQ_SQLITE_MAX_ATTEMPTS" ] || ! sqlite_error_is_transient "$output"; then
+      printf '%s\n' "$output" >&2
+      return "$status"
+    fi
+
+    sqlite_backoff "$attempt"
+    attempt=$((attempt + 1))
+  done
 }
 
 sqlite_exec() {
   local db=$1
   local sql=$2
-  sqlite3 -batch "$db" "$sql"
+  sqlite_run "$db" "$sql"
 }
 
 sqlite_value() {
   local db=$1
   local sql=$2
-  sqlite3 -batch -noheader "$db" "$sql"
+  sqlite_run "$db" "$sql" -noheader
+}
+
+sqlite_query() {
+  local db=$1
+  local sql=$2
+  sqlite_run "$db" "$sql" -noheader
+}
+
+sqlite_table() {
+  local db=$1
+  local sql=$2
+  sqlite_run "$db" "$sql" -header -column
 }
 
 now_epoch() {
@@ -379,7 +489,7 @@ init_state_db() {
   local db
   db=$(state_db_path)
   mkdir -p "$(dirname "$db")"
-  sqlite3 -batch "$db" "CREATE TABLE IF NOT EXISTS cxq_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+  sqlite_run "$db" "PRAGMA journal_mode = WAL; CREATE TABLE IF NOT EXISTS cxq_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);" >/dev/null
 }
 
 state_get() {
@@ -387,7 +497,7 @@ state_get() {
   local db
   init_state_db
   db=$(state_db_path)
-  sqlite3 -batch -noheader "$db" "SELECT value FROM cxq_state WHERE key = $(sql_quote "$key");"
+  sqlite_query "$db" "SELECT value FROM cxq_state WHERE key = $(sql_quote "$key");"
 }
 
 state_set() {
@@ -396,7 +506,7 @@ state_set() {
   local db
   init_state_db
   db=$(state_db_path)
-  sqlite3 -batch "$db" "INSERT OR REPLACE INTO cxq_state (key, value) VALUES ($(sql_quote "$key"), $(sql_quote "$value"));"
+  sqlite_run "$db" "INSERT OR REPLACE INTO cxq_state (key, value) VALUES ($(sql_quote "$key"), $(sql_quote "$value"));" >/dev/null
 }
 
 mark_update_required() {
@@ -437,20 +547,47 @@ stable_semver() {
   return 1
 }
 
+# Splits a project version into "major minor patch rank".
+# rank 0 means an unreleased X.Y.Z-dev build, rank 1 means the stable X.Y.Z.
+# A dev build always sorts below the stable release it is working towards.
+version_parts() {
+  local version=${1#v}
+  local rank=1
+  case "$version" in
+    *-dev) version=${version%-dev}; rank=0 ;;
+  esac
+  if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    printf '%s %s %s %s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "$rank"
+    return 0
+  fi
+  return 1
+}
+
+version_is_dev() {
+  case "${1:-}" in
+    *-dev) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# True when the left version is strictly greater than the right version.
+# Both sides accept X.Y.Z and X.Y.Z-dev.
 semver_gt() {
   local left right
-  left=$(stable_semver "$1") || return 1
-  right=$(stable_semver "$2") || return 1
+  left=$(version_parts "$1") || return 1
+  right=$(version_parts "$2") || return 1
 
-  local l_major l_minor l_patch r_major r_minor r_patch
-  IFS=. read -r l_major l_minor l_patch <<<"$left"
-  IFS=. read -r r_major r_minor r_patch <<<"$right"
+  local l_major l_minor l_patch l_rank r_major r_minor r_patch r_rank
+  read -r l_major l_minor l_patch l_rank <<<"$left"
+  read -r r_major r_minor r_patch r_rank <<<"$right"
 
   if [ "$((10#$l_major))" -gt "$((10#$r_major))" ]; then return 0; fi
   if [ "$((10#$l_major))" -lt "$((10#$r_major))" ]; then return 1; fi
   if [ "$((10#$l_minor))" -gt "$((10#$r_minor))" ]; then return 0; fi
   if [ "$((10#$l_minor))" -lt "$((10#$r_minor))" ]; then return 1; fi
-  [ "$((10#$l_patch))" -gt "$((10#$r_patch))" ]
+  if [ "$((10#$l_patch))" -gt "$((10#$r_patch))" ]; then return 0; fi
+  if [ "$((10#$l_patch))" -lt "$((10#$r_patch))" ]; then return 1; fi
+  [ "$l_rank" -gt "$r_rank" ]
 }
 
 valid_project_version() {
@@ -602,7 +739,11 @@ run_remote_update_check() {
     return 0
   fi
 
-  record_update_check_result "up-to-date: $latest"
+  if version_is_dev "$CXQ_VERSION"; then
+    record_update_check_result "dev-build: $CXQ_VERSION is ahead of latest stable $latest"
+  else
+    record_update_check_result "up-to-date: $latest"
+  fi
   clear_update_required_if_kind "self"
   return 0
 }
@@ -675,7 +816,7 @@ setup_project_queue() {
   mkdir -p "$prompt_dir"
   write_file_if_missing "$schema_file" ".codex/tasks.schema.sql" schema_sql
   write_file_if_missing "$prompt_file" ".codex/prompts/task.md" prompt_template
-  schema_sql | sqlite3 -batch "$db" >/dev/null
+  sqlite_run "$db" "$(schema_sql)" >/dev/null
   append_gitignore "$root/.gitignore"
   append_agents_contract "$root/AGENTS.md"
 
@@ -712,7 +853,7 @@ repo_update_reason() {
   fi
 
   if [ -f "$db" ]; then
-    version=$(sqlite3 -batch -noheader "$db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';" 2>/dev/null || true)
+    version=$(sqlite_query "$db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';" 2>/dev/null || true)
     if ! [[ "$version" =~ ^[0-9]+$ ]]; then
       version=0
     fi
@@ -830,7 +971,7 @@ cmd_add() {
 format_task_text() {
   local db=$1
   local id=$2
-  sqlite3 -batch -header -column "$db" "SELECT id, status, priority, title, claimed_by, lease_until FROM tasks WHERE id = $id;"
+  sqlite_table "$db" "SELECT id, status, priority, title, claimed_by, lease_until FROM tasks WHERE id = $id;"
 }
 
 print_json_array_md() {
@@ -838,7 +979,7 @@ print_json_array_md() {
   local id=$2
   local column=$3
   local values
-  values=$(sqlite3 -batch -noheader "$db" "SELECT '- ' || value FROM json_each((SELECT $column FROM tasks WHERE id = $id));" 2>/dev/null || true)
+  values=$(sqlite_query "$db" "SELECT '- ' || value FROM json_each((SELECT $column FROM tasks WHERE id = $id));" 2>/dev/null || true)
   if [ -n "$values" ]; then
     printf '%s\n' "$values"
   else
@@ -851,8 +992,8 @@ render_task_dependencies() {
   local id=$2
   local blockers blocks
 
-  blockers=$(sqlite3 -batch -noheader "$db" "SELECT '- #' || t.id || ' [' || t.status || '] ' || t.title FROM task_dependencies td JOIN tasks t ON t.id = td.blocker_task_id WHERE td.task_id = $id ORDER BY t.status <> 'done' DESC, t.priority DESC, t.id ASC;")
-  blocks=$(sqlite3 -batch -noheader "$db" "SELECT '- #' || t.id || ' [' || t.status || '] ' || t.title FROM task_dependencies td JOIN tasks t ON t.id = td.task_id WHERE td.blocker_task_id = $id ORDER BY t.status <> 'done' DESC, t.priority DESC, t.id ASC;")
+  blockers=$(sqlite_query "$db" "SELECT '- #' || t.id || ' [' || t.status || '] ' || t.title FROM task_dependencies td JOIN tasks t ON t.id = td.blocker_task_id WHERE td.task_id = $id ORDER BY t.status <> 'done' DESC, t.priority DESC, t.id ASC;")
+  blocks=$(sqlite_query "$db" "SELECT '- #' || t.id || ' [' || t.status || '] ' || t.title FROM task_dependencies td JOIN tasks t ON t.id = td.task_id WHERE td.blocker_task_id = $id ORDER BY t.status <> 'done' DESC, t.priority DESC, t.id ASC;")
 
   printf '## Dependencies\n'
   printf 'Blocked by:\n'
@@ -939,6 +1080,8 @@ render_task_core() {
   if [ -n "$result_summary" ]; then
     printf '## Result summary\n%s\n\n' "$result_summary"
   fi
+
+  render_task_findings "$db" "$id"
 }
 
 render_task_events() {
@@ -946,7 +1089,7 @@ render_task_events() {
   local id=$2
   local events
 
-  events=$(sqlite3 -batch -noheader "$db" "SELECT '- ' || created_at || ' \`' || event_type || '\` by ' || actor || CASE WHEN note <> '' THEN ': ' || replace(note, char(10), ' ') ELSE '' END FROM (SELECT id, created_at, event_type, actor, note FROM task_events WHERE task_id = $id ORDER BY created_at DESC, id DESC LIMIT 10) ORDER BY created_at ASC, id ASC;")
+  events=$(sqlite_query "$db" "SELECT '- ' || created_at || ' \`' || event_type || '\` by ' || actor || CASE WHEN note <> '' THEN ': ' || replace(note, char(10), ' ') ELSE '' END FROM (SELECT id, created_at, event_type, actor, note FROM task_events WHERE task_id = $id ORDER BY created_at DESC, id DESC LIMIT 10) ORDER BY created_at ASC, id ASC;")
 
   printf '## Recent events\n'
   if [ -n "$events" ]; then
@@ -1024,14 +1167,33 @@ require_task_id() {
   [[ "$id" =~ ^[0-9]+$ ]] || die "task id must be an integer."
 }
 
+list_status_order_sql() {
+  printf "CASE status WHEN 'ready' THEN 0 WHEN 'claimed' THEN 1 WHEN 'review' THEN 2 WHEN 'blocked' THEN 3 WHEN 'inbox' THEN 4 ELSE 5 END"
+}
+
+cmd_list_questions() {
+  local db=$1
+  sqlite_table "$db" "SELECT t.id, t.status, t.priority, t.title, replace(e.note, char(10), ' ') AS question FROM tasks t JOIN task_events e ON e.task_id = t.id WHERE e.event_type = 'note' AND (e.note LIKE 'DUDA:%' OR e.note LIKE 'BLOCKER:%') AND t.status NOT IN ('done', 'wontfix') ORDER BY $(list_status_order_sql), t.priority DESC, e.id ASC;"
+}
+
+cmd_list_needs_action() {
+  local db=$1
+  sqlite_table "$db" "SELECT id, status, priority, title, COALESCE(claimed_by, '') AS claimed_by, (SELECT COUNT(*) FROM task_findings f WHERE f.task_id = tasks.id AND f.status = 'open') AS open_findings FROM tasks WHERE status IN ('ready', 'blocked') OR (status = 'review' AND EXISTS (SELECT 1 FROM task_findings f WHERE f.task_id = tasks.id AND f.status = 'open')) ORDER BY $(list_status_order_sql), priority DESC, created_at ASC;"
+}
+
 cmd_list() {
   require_sqlite3
 
-  local include_all=0 status=""
+  local include_all=0 status="" view=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --all)
         include_all=1
+        shift
+        ;;
+      --needs-action|--questions)
+        [ -z "$view" ] || die "choose only one list view."
+        view=$1
         shift
         ;;
       --status)
@@ -1052,6 +1214,18 @@ cmd_list() {
 
   local db where
   db=$(db_path_or_die)
+
+  case "$view" in
+    --needs-action)
+      cmd_list_needs_action "$db"
+      return
+      ;;
+    --questions)
+      cmd_list_questions "$db"
+      return
+      ;;
+  esac
+
   if [ -n "$status" ]; then
     where="status = $(sql_quote "$status")"
   elif [ "$include_all" -eq 1 ]; then
@@ -1060,7 +1234,34 @@ cmd_list() {
     where="status NOT IN ('done', 'wontfix')"
   fi
 
-  sqlite3 -batch -header -column "$db" "SELECT id, status, priority, title, COALESCE(claimed_by, '') AS claimed_by, COALESCE(lease_until, '') AS lease_until FROM tasks WHERE $where ORDER BY CASE status WHEN 'ready' THEN 0 WHEN 'claimed' THEN 1 WHEN 'review' THEN 2 WHEN 'blocked' THEN 3 WHEN 'inbox' THEN 4 ELSE 5 END, priority DESC, created_at ASC;"
+  sqlite_table "$db" "SELECT id, status, priority, title, COALESCE(claimed_by, '') AS claimed_by, COALESCE(lease_until, '') AS lease_until FROM tasks WHERE $where ORDER BY $(list_status_order_sql), priority DESC, created_at ASC;"
+}
+
+cmd_review_stale() {
+  require_sqlite3
+
+  local older_than="24h"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --older-than)
+        [ "$#" -ge 2 ] || die "--older-than requires a value."
+        older_than=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown review-stale option: $1"
+        ;;
+    esac
+  done
+
+  local db modifier
+  db=$(db_path_or_die)
+  modifier=$(duration_modifier "$older_than" "-" "--older-than")
+  sqlite_table "$db" "SELECT id, priority, title, updated_at, (SELECT COUNT(*) FROM task_findings f WHERE f.task_id = tasks.id AND f.status = 'open') AS open_findings FROM tasks WHERE status = 'review' AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', $(sql_quote "$modifier")) ORDER BY updated_at ASC;"
 }
 
 cmd_next() {
@@ -1211,16 +1412,235 @@ cmd_unblock() {
   printf 'Task #%s is no longer blocked by #%s\n' "$id" "$blocker_id"
 }
 
-lease_modifier() {
-  local lease=${1:-2h}
-  if [[ "$lease" =~ ^([0-9]+)m$ ]]; then
-    printf '+%s minutes' "${BASH_REMATCH[1]}"
-  elif [[ "$lease" =~ ^([0-9]+)h$ ]]; then
-    printf '+%s hours' "${BASH_REMATCH[1]}"
-  elif [[ "$lease" =~ ^([0-9]+)d$ ]]; then
-    printf '+%s days' "${BASH_REMATCH[1]}"
+duration_modifier() {
+  local duration=${1-}
+  local sign=${2:-+}
+  local label=${3:-duration}
+  if [[ "$duration" =~ ^([0-9]+)m$ ]]; then
+    printf '%s%s minutes' "$sign" "${BASH_REMATCH[1]}"
+  elif [[ "$duration" =~ ^([0-9]+)h$ ]]; then
+    printf '%s%s hours' "$sign" "${BASH_REMATCH[1]}"
+  elif [[ "$duration" =~ ^([0-9]+)d$ ]]; then
+    printf '%s%s days' "$sign" "${BASH_REMATCH[1]}"
   else
-    die "lease must look like 30m, 2h, or 1d."
+    die "$label must look like 30m, 2h, or 1d."
+  fi
+}
+
+lease_modifier() {
+  duration_modifier "${1:-2h}" "+" "lease"
+}
+
+# Single source of truth for supported status movements.
+# Each line is: from|to|command that performs it.
+status_transitions_table() {
+  cat <<'EOF'
+inbox|ready|cxq reopen <id> --to ready --reason "..."
+inbox|claimed|cxq claim <id>
+ready|claimed|cxq claim <id> or cxq claim-next
+ready|blocked|cxq reopen <id> --to blocked --reason "..."
+claimed|ready|cxq release <id>
+claimed|blocked|cxq reopen <id> --to blocked --reason "..."
+claimed|review|cxq review <id> --summary "..."
+claimed|done|cxq done <id>
+blocked|ready|cxq release <id>
+blocked|inbox|cxq reopen <id> --to inbox --reason "..."
+review|ready|cxq reopen <id> --reason "..."
+review|inbox|cxq reopen <id> --to inbox --reason "..."
+review|blocked|cxq reopen <id> --to blocked --reason "..."
+review|done|cxq done <id>
+done|ready|cxq reopen <id> --reason "..."
+done|inbox|cxq reopen <id> --to inbox --reason "..."
+wontfix|ready|cxq reopen <id> --reason "..."
+wontfix|inbox|cxq reopen <id> --to inbox --reason "..."
+EOF
+}
+
+transition_allows() {
+  local from=$1
+  local to=$2
+  local t_from t_to rest
+  while IFS='|' read -r t_from t_to rest; do
+    [ -n "$t_from" ] || continue
+    if [ "$t_from" = "$from" ] && [ "$t_to" = "$to" ]; then
+      return 0
+    fi
+  done <<<"$(status_transitions_table)"
+  return 1
+}
+
+cmd_status_transitions() {
+  [ "$#" -eq 0 ] || die "status-transitions does not accept arguments."
+
+  local from to command
+  printf '# cxq status transitions\n\n'
+  printf '%-8s  %-8s  %s\n' "from" "to" "command"
+  printf '%-8s  %-8s  %s\n' "--------" "--------" "--------------------------------------"
+  while IFS='|' read -r from to command; do
+    [ -n "$from" ] || continue
+    printf '%-8s  %-8s  %s\n' "$from" "$to" "$command"
+  done <<<"$(status_transitions_table)"
+  printf '\nAgents normally stop at review. A human decides done.\n'
+}
+
+cmd_reopen() {
+  require_sqlite3
+  [ "$#" -ge 1 ] || die "usage: cxq reopen <id> [--to ready|inbox|blocked] --reason <reason>"
+
+  local id=$1 target="ready" reason=""
+  require_task_id "$id"
+  shift
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --to)
+        [ "$#" -ge 2 ] || die "--to requires a value."
+        target=$2
+        shift 2
+        ;;
+      --reason)
+        [ "$#" -ge 2 ] || die "--reason requires a value."
+        reason=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown reopen option: $1"
+        ;;
+    esac
+  done
+
+  case "$target" in
+    ready|inbox|blocked) ;;
+    *) die "reopen target must be ready, inbox, or blocked." ;;
+  esac
+  [ -n "$reason" ] || die "reopen reason is required."
+
+  local db actor from
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  from=$(sqlite_value "$db" "SELECT status FROM tasks WHERE id = $id;")
+  [ "$from" != "$target" ] || die "task $id is already $target."
+  transition_allows "$from" "$target" ||
+    die "cannot move task $id from $from to $target; run 'cxq status-transitions'."
+
+  actor=$(current_actor)
+  sqlite_exec "$db" "UPDATE tasks SET status = $(sql_quote "$target"), claimed_by = NULL, claimed_at = NULL, lease_until = NULL WHERE id = $id;"
+  log_event "$db" "$id" "reopened" "$actor" "$from -> $target: $reason"
+  printf 'Reopened task #%s: %s -> %s\n' "$id" "$from" "$target"
+}
+
+cmd_followup() {
+  require_sqlite3
+  [ "$#" -ge 1 ] || die "usage: cxq followup <id> <title> [options]"
+
+  local parent=$1
+  require_task_id "$parent"
+  shift
+
+  local title="" body="" priority="" close=0 files="" tags="" acceptance="" verify=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --priority)
+        [ "$#" -ge 2 ] || die "--priority requires a value."
+        priority=$2
+        shift 2
+        ;;
+      --body)
+        [ "$#" -ge 2 ] || die "--body requires a value."
+        body=$2
+        shift 2
+        ;;
+      --files|--allowed-paths)
+        [ "$#" -ge 2 ] || die "$1 requires a value."
+        files=$2
+        shift 2
+        ;;
+      --tag)
+        [ "$#" -ge 2 ] || die "--tag requires a value."
+        tags="${tags}${tags:+,}$2"
+        shift 2
+        ;;
+      --acceptance)
+        [ "$#" -ge 2 ] || die "--acceptance requires a value."
+        acceptance=$2
+        shift 2
+        ;;
+      --verify|--verify-command)
+        [ "$#" -ge 2 ] || die "$1 requires a value."
+        verify=$2
+        shift 2
+        ;;
+      --close)
+        close=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --*)
+        die "unknown followup option: $1"
+        ;;
+      *)
+        if [ -z "$title" ]; then
+          title=$1
+        else
+          body="${body}${body:+ }$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$title" ] || die "followup title is required."
+  if [ -n "$priority" ]; then
+    [[ "$priority" =~ ^[0-9]+$ ]] || die "priority must be an integer."
+  fi
+
+  local db root branch actor files_json tags_json new_id full_body
+  db=$(db_path_or_die)
+  task_exists "$db" "$parent" || die "task not found: $parent"
+  root=$(project_root_or_die)
+  branch=$(current_branch "$root")
+  actor=$(current_actor)
+
+  if [ -n "$files" ]; then
+    files_json=$(csv_to_json_array "$files")
+  else
+    files_json=$(sqlite_value "$db" "SELECT allowed_paths_json FROM tasks WHERE id = $parent;")
+  fi
+  if [ -n "$tags" ]; then
+    tags_json=$(csv_to_json_array "$tags")
+  else
+    tags_json=$(sqlite_value "$db" "SELECT tags_json FROM tasks WHERE id = $parent;")
+  fi
+  if [ -z "$priority" ]; then
+    priority=$(sqlite_value "$db" "SELECT priority FROM tasks WHERE id = $parent;")
+  fi
+  if [ -z "$verify" ]; then
+    verify=$(sqlite_value "$db" "SELECT verify_command FROM tasks WHERE id = $parent;")
+  fi
+
+  full_body="Follow-up of task #$parent."
+  if [ -n "$body" ]; then
+    full_body="$full_body"$'\n\n'"$body"
+  fi
+
+  new_id=$(sqlite_value "$db" "INSERT INTO tasks (title, body, status, priority, repo_path, branch, allowed_paths_json, tags_json, acceptance, verify_command) VALUES ($(sql_quote "$title"), $(sql_quote "$full_body"), 'ready', $priority, $(sql_quote "$root"), $(sql_quote "$branch"), $(sql_quote "$files_json"), $(sql_quote "$tags_json"), $(sql_quote "$acceptance"), $(sql_quote "$verify")); SELECT last_insert_rowid();")
+  sqlite_exec "$db" "INSERT OR IGNORE INTO task_dependencies (task_id, blocker_task_id) VALUES ($new_id, $parent);"
+  log_event "$db" "$new_id" "created" "$actor" "$title"
+  log_event "$db" "$new_id" "followup_of" "$actor" "follow-up of #$parent"
+  log_event "$db" "$parent" "followup_created" "$actor" "follow-up #$new_id: $title"
+  printf 'Created follow-up task #%s for #%s\n' "$new_id" "$parent"
+
+  if [ "$close" -eq 1 ]; then
+    sqlite_exec "$db" "UPDATE tasks SET status = 'done', result_summary = TRIM(result_summary || ' Closed with follow-up #$new_id.'), claimed_by = NULL, claimed_at = NULL, lease_until = NULL WHERE id = $parent;"
+    log_event "$db" "$parent" "done" "$actor" "closed with follow-up #$new_id"
+    printf 'Closed task #%s with follow-up #%s\n' "$parent" "$new_id"
   fi
 }
 
@@ -1341,7 +1761,7 @@ FROM cxq_claim_next_selection;
 SELECT id FROM cxq_claim_next_selection;
 COMMIT;
 "
-  id=$(sqlite3 -batch -noheader "$db" "$sql")
+  id=$(sqlite_query "$db" "$sql")
   if [ -z "$id" ]; then
     printf 'No available tasks.\n' >&2
     exit 1
@@ -1421,11 +1841,56 @@ cmd_review() {
   printf 'Moved task #%s to review\n' "$id"
 }
 
+# Deliberately narrow: a false warning costs a --force, but a chatty heuristic
+# trains people to ignore it. 'todo' alone is not a marker because it is an
+# ordinary Spanish word; only the uppercase code marker counts.
+summary_mentions_pending_work() {
+  local raw=${1-}
+  local text
+  text=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+
+  case "$raw" in
+    *TODO*) return 0 ;;
+  esac
+
+  case "$text" in
+    *pending*|*pendiente*|*"still needs"*|*"still missing"*|*"not implemented"*|*"no implementado"*|*"sin terminar"*|*"left over"*|*leftover*|*"follow-up"*|*followup*|*falta*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Prints the reasons closing this task looks premature. Returns 1 when clean.
+done_close_warnings() {
+  local db=$1
+  local id=$2
+  local summary=$3
+  local warnings="" open_findings
+
+  if summary_mentions_pending_work "$summary"; then
+    warnings="${warnings}${warnings:+; }the summary still mentions pending work"
+  fi
+
+  open_findings=$(task_open_finding_count "$db" "$id" 2>/dev/null || printf '0')
+  if [[ "$open_findings" =~ ^[0-9]+$ ]] && [ "$open_findings" -gt 0 ]; then
+    warnings="${warnings}${warnings:+; }task has $open_findings open finding(s)"
+  fi
+
+  if [ -n "$warnings" ]; then
+    printf '%s' "$warnings"
+    return 0
+  fi
+  return 1
+}
+
 cmd_done() {
   require_sqlite3
   [ "$#" -ge 1 ] || die "task id is required."
 
-  local id=$1 summary=""
+  local id=$1 summary="" force=0
   require_task_id "$id"
   shift
 
@@ -1435,6 +1900,10 @@ cmd_done() {
         [ "$#" -ge 2 ] || die "--summary requires a value."
         summary=$2
         shift 2
+        ;;
+      --force|--yes)
+        force=1
+        shift
         ;;
       --help|-h)
         usage
@@ -1447,13 +1916,211 @@ cmd_done() {
     esac
   done
 
-  local db actor
+  local db actor effective_summary warnings answer
   db=$(db_path_or_die)
   task_exists "$db" "$id" || die "task not found: $id"
   actor=$(current_actor)
+
+  effective_summary=$summary
+  if [ -z "$effective_summary" ]; then
+    effective_summary=$(sqlite_value "$db" "SELECT result_summary FROM tasks WHERE id = $id;")
+  fi
+
+  warnings=$(done_close_warnings "$db" "$id" "$effective_summary" || true)
+  if [ -n "$warnings" ] && [ "$force" -ne 1 ]; then
+    printf 'Warning: task #%s may not be finished: %s\n' "$id" "$warnings" >&2
+    if gate_is_interactive; then
+      printf 'Mark task #%s done anyway? [y/N] ' "$id" >&2
+      answer=$(gate_read_answer)
+      printf '\n' >&2
+      case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) die "task $id was not closed." ;;
+      esac
+    else
+      printf 'Run: cxq done %s --force\n' "$id" >&2
+      die "task $id has unfinished work; use --force to close it anyway."
+    fi
+  fi
   sqlite_exec "$db" "UPDATE tasks SET status = 'done', result_summary = CASE WHEN $(sql_quote "$summary") = '' THEN result_summary ELSE $(sql_quote "$summary") END, claimed_by = NULL, claimed_at = NULL, lease_until = NULL WHERE id = $id;"
   log_event "$db" "$id" "done" "$actor" "$summary"
   printf 'Marked task #%s done\n' "$id"
+}
+
+finding_severity_is_valid() {
+  case "${1-}" in
+    low|medium|high|critical) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+finding_status_is_valid() {
+  case "${1-}" in
+    open|accepted|resolved) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+task_open_finding_count() {
+  local db=$1
+  local id=$2
+  sqlite_value "$db" "SELECT COUNT(*) FROM task_findings WHERE task_id = $id AND status = 'open';"
+}
+
+render_task_findings() {
+  local db=$1
+  local id=$2
+  local findings
+
+  findings=$(sqlite_query "$db" "SELECT '- #' || id || ' [' || severity || '/' || status || '] ' || replace(note, char(10), ' ') || CASE WHEN followup_task_id IS NOT NULL THEN ' (follow-up #' || followup_task_id || ')' ELSE '' END FROM task_findings WHERE task_id = $id ORDER BY status = 'open' DESC, id ASC;" 2>/dev/null || true)
+
+  [ -n "$findings" ] || return 0
+  printf '## Findings\n'
+  printf '%s\n' "$findings"
+  printf '\n'
+}
+
+cmd_finding_add() {
+  local id=${1-}
+  require_task_id "$id"
+  shift
+
+  local severity="medium" status="open" note="" followup=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --severity)
+        [ "$#" -ge 2 ] || die "--severity requires a value."
+        severity=$2
+        shift 2
+        ;;
+      --status)
+        [ "$#" -ge 2 ] || die "--status requires a value."
+        status=$2
+        shift 2
+        ;;
+      --note)
+        [ "$#" -ge 2 ] || die "--note requires a value."
+        note=$2
+        shift 2
+        ;;
+      --followup)
+        [ "$#" -ge 2 ] || die "--followup requires a task id."
+        followup=$2
+        require_task_id "$followup"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --*)
+        die "unknown finding option: $1"
+        ;;
+      *)
+        note="${note}${note:+ }$1"
+        shift
+        ;;
+    esac
+  done
+
+  finding_severity_is_valid "$severity" || die "finding severity must be low, medium, high, or critical."
+  finding_status_is_valid "$status" || die "finding status must be open, accepted, or resolved."
+  [ -n "$note" ] || die "finding note is required."
+
+  local db actor finding_id followup_sql
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  if [ -n "$followup" ]; then
+    task_exists "$db" "$followup" || die "follow-up task not found: $followup"
+    followup_sql="$followup"
+  else
+    followup_sql="NULL"
+  fi
+
+  finding_id=$(sqlite_value "$db" "INSERT INTO task_findings (task_id, severity, status, note, followup_task_id) VALUES ($id, $(sql_quote "$severity"), $(sql_quote "$status"), $(sql_quote "$note"), $followup_sql); SELECT last_insert_rowid();")
+  actor=$(current_actor)
+  log_event "$db" "$id" "finding_added" "$actor" "[$severity/$status] $note"
+  printf 'Added finding #%s to task #%s\n' "$finding_id" "$id"
+}
+
+cmd_finding_list() {
+  [ "$#" -eq 1 ] || die "usage: cxq finding list <id>"
+  local id=$1 db
+  require_task_id "$id"
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  sqlite_table "$db" "SELECT id, severity, status, note, COALESCE(followup_task_id, '') AS followup, created_at FROM task_findings WHERE task_id = $id ORDER BY status = 'open' DESC, id ASC;"
+}
+
+cmd_finding_resolve() {
+  local finding_id=${1-}
+  require_task_id "$finding_id"
+  shift
+
+  local status="resolved" note=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --status)
+        [ "$#" -ge 2 ] || die "--status requires a value."
+        status=$2
+        shift 2
+        ;;
+      --note)
+        [ "$#" -ge 2 ] || die "--note requires a value."
+        note=$2
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown finding resolve option: $1"
+        ;;
+    esac
+  done
+
+  case "$status" in
+    accepted|resolved) ;;
+    *) die "finding resolve status must be accepted or resolved." ;;
+  esac
+
+  local db actor task_id changed
+  db=$(db_path_or_die)
+  task_id=$(sqlite_value "$db" "SELECT task_id FROM task_findings WHERE id = $finding_id;")
+  [ -n "$task_id" ] || die "finding not found: $finding_id"
+
+  changed=$(sqlite_value "$db" "UPDATE task_findings SET status = $(sql_quote "$status"), note = CASE WHEN $(sql_quote "$note") = '' THEN note ELSE note || ' | ' || $(sql_quote "$note") END WHERE id = $finding_id AND status = 'open'; SELECT changes();")
+  [ "$changed" = "1" ] || die "finding $finding_id is not open."
+
+  actor=$(current_actor)
+  log_event "$db" "$task_id" "finding_closed" "$actor" "finding #$finding_id $status${note:+: $note}"
+  printf 'Marked finding #%s as %s\n' "$finding_id" "$status"
+}
+
+cmd_finding() {
+  require_sqlite3
+  local action=${1-}
+  case "$action" in
+    add)
+      shift
+      cmd_finding_add "$@"
+      ;;
+    list)
+      shift
+      cmd_finding_list "$@"
+      ;;
+    resolve)
+      shift
+      cmd_finding_resolve "$@"
+      ;;
+    ""|--help|-h)
+      die "usage: cxq finding add|list|resolve ..."
+      ;;
+    *)
+      die "unknown finding action: $action"
+      ;;
+  esac
 }
 
 cmd_repo() {
@@ -1472,7 +2139,7 @@ cmd_stale() {
   require_sqlite3
   local db
   db=$(db_path_or_die)
-  sqlite3 -batch -header -column "$db" "SELECT id, status, priority, title, claimed_by, lease_until FROM tasks WHERE status = 'claimed' AND lease_until IS NOT NULL AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ORDER BY lease_until ASC;"
+  sqlite_table "$db" "SELECT id, status, priority, title, claimed_by, lease_until FROM tasks WHERE status = 'claimed' AND lease_until IS NOT NULL AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ORDER BY lease_until ASC;"
 }
 
 cmd_task_release() {
@@ -1483,9 +2150,9 @@ cmd_task_release() {
   require_task_id "$id"
   db=$(db_path_or_die)
   task_exists "$db" "$id" || die "task not found: $id"
-  changed=$(sqlite_value "$db" "UPDATE tasks SET status = 'ready', claimed_by = NULL, claimed_at = NULL, lease_until = NULL WHERE id = $id AND status = 'claimed'; SELECT changes();")
+  changed=$(sqlite_value "$db" "UPDATE tasks SET status = 'ready', claimed_by = NULL, claimed_at = NULL, lease_until = NULL WHERE id = $id AND status IN ('claimed', 'blocked'); SELECT changes();")
   if [ "$changed" = "0" ]; then
-    die "task $id is not claimed."
+    die "task $id is not claimed or blocked; run 'cxq status-transitions'."
   fi
   actor=$(current_actor)
   log_event "$db" "$id" "released" "$actor" ""
@@ -1596,14 +2263,83 @@ release_run_tests() {
   make test
 }
 
+# Highest local stable tag that is strictly below the version being released.
+previous_stable_tag() {
+  local root=$1
+  local version=$2
+  local line ref candidate best=""
+
+  while IFS= read -r line; do
+    ref=$(trim "$line")
+    [ -n "$ref" ] || continue
+    candidate=$(stable_semver "$ref" 2>/dev/null || true)
+    [ -n "$candidate" ] || continue
+    semver_gt "$version" "$candidate" || continue
+    if [ -z "$best" ] || semver_gt "$candidate" "$best"; then
+      best=$candidate
+    fi
+  done <<<"$(git -C "$root" tag -l 'v*' 2>/dev/null || true)"
+
+  if [ -n "$best" ]; then
+    printf 'v%s' "$best"
+  fi
+}
+
+release_commit_summary() {
+  local root=$1
+  local previous=$2
+  local range limit=20 total lines
+
+  if [ -n "$previous" ]; then
+    range="$previous..HEAD"
+  else
+    range="HEAD"
+  fi
+
+  total=$(git -C "$root" rev-list --no-merges --count "$range" 2>/dev/null || printf '0')
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  if [ "$total" -eq 0 ]; then
+    printf -- '- No commits found for this range.\n'
+    return 0
+  fi
+
+  lines=$(git -C "$root" log --no-merges --format='- %s' -n "$limit" "$range" 2>/dev/null || true)
+  if [ -z "$lines" ]; then
+    printf -- '- No commits found for this range.\n'
+    return 0
+  fi
+
+  printf '%s\n' "$lines"
+  if [ "$total" -gt "$limit" ]; then
+    printf -- '- ...and %s more commits.\n' "$((total - limit))"
+  fi
+}
+
 release_prepare_notes() {
   local version=$1
-  local notes
+  local root=${2-}
+  local notes previous summary intro
+
+  [ -n "$root" ] || root=$(git_root 2>/dev/null || printf '.')
   notes=$(release_notes_path "$version")
+  previous=$(previous_stable_tag "$root" "$version")
+
+  if [ -n "$previous" ]; then
+    intro="Changes since $previous."
+    summary=$(release_commit_summary "$root" "$previous")
+  else
+    intro="First release draft: no previous stable tag was found."
+    summary=$(release_commit_summary "$root" "")
+  fi
+
   cat >"$notes" <<EOF
 ## cxq v$version
 
-Release summary.
+$intro
+
+### Highlights
+
+$summary
 
 ### Update
 
@@ -1616,7 +2352,7 @@ cxq update --status
 
 ### Notes
 
-- Add notes here before publishing.
+- Review the generated highlights before publishing.
 EOF
   printf '%s' "$notes"
 }
@@ -1630,7 +2366,7 @@ cmd_release_prepare() {
   release_warn_dirty
   release_check_tag_available "$version"
   release_run_tests "$skip_tests"
-  notes=$(release_prepare_notes "$version")
+  notes=$(release_prepare_notes "$version" "$root")
   printf 'Prepared release notes:\n'
   printf '  %s\n\n' "$notes"
   printf 'Next:\n'
@@ -1681,7 +2417,7 @@ cmd_release_publish() {
   command -v gh >/dev/null 2>&1 || die "gh is required to publish releases."
   git rev-parse -q --verify "refs/tags/v$version" >/dev/null || die "tag v$version does not exist locally."
   if [ ! -f "$notes" ]; then
-    notes=$(release_prepare_notes "$version")
+    notes=$(release_prepare_notes "$version" "$root")
   fi
   gh release create "v$version" \
     --repo daniel-aranda/Agents-todo \
@@ -1881,9 +2617,42 @@ cmd_doctor() {
     else
       printf 'repo_update_required: no\n'
     fi
+    doctor_report_repo_db "$root/.codex/tasks.db"
   else
     printf 'repo_update_required: unknown\n'
     printf 'repo_update_reason: sqlite3 missing\n'
+    printf 'repo_db: unknown\n'
+  fi
+}
+
+# Read-only diagnostics for the project queue database.
+doctor_report_repo_db() {
+  local db=$1
+  local schema counts integrity tasks
+
+  if [ ! -f "$db" ]; then
+    printf 'repo_db: none\n'
+    printf 'repo_schema_version: none\n'
+    printf 'repo_task_counts: none\n'
+    printf 'repo_db_integrity: none\n'
+    return 0
+  fi
+
+  printf 'repo_db: %s\n' "$db"
+
+  schema=$(sqlite_value "$db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';" 2>/dev/null || true)
+  printf 'repo_schema_version: %s (expected %s)\n' "${schema:-unknown}" "$CXQ_REPO_SCHEMA_VERSION"
+
+  tasks=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks;" 2>/dev/null || true)
+  counts=$(sqlite_query "$db" "SELECT group_concat(status || '=' || n, ' ') FROM (SELECT status, COUNT(*) AS n FROM tasks GROUP BY status ORDER BY status);" 2>/dev/null || true)
+  printf 'repo_task_total: %s\n' "${tasks:-unknown}"
+  printf 'repo_task_counts: %s\n' "${counts:-none}"
+
+  integrity=$(sqlite_query "$db" "PRAGMA integrity_check;" 2>/dev/null || true)
+  if [ "$integrity" = "ok" ]; then
+    printf 'repo_db_integrity: ok\n'
+  else
+    printf 'repo_db_integrity: %s\n' "${integrity:-unknown}"
   fi
 }
 
@@ -2054,6 +2823,7 @@ EOF
 command_uses_update_gate() {
   case "${1:-}" in
     add|list|ls|next|show|claim|claim-next|block|deps|unblock|note|prompt|review|done|repo|stale) return 0 ;;
+    reopen|followup|split|finding|review-stale) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2258,6 +3028,26 @@ main() {
       shift
       [ "$#" -eq 0 ] || die "stale does not accept arguments."
       cmd_stale
+      ;;
+    reopen)
+      shift
+      cmd_reopen "$@"
+      ;;
+    followup|split)
+      shift
+      cmd_followup "$@"
+      ;;
+    finding)
+      shift
+      cmd_finding "$@"
+      ;;
+    review-stale)
+      shift
+      cmd_review_stale "$@"
+      ;;
+    status-transitions)
+      shift
+      cmd_status_transitions "$@"
       ;;
     release)
       shift

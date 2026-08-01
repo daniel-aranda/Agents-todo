@@ -185,6 +185,15 @@ cxq unblock 42 --by 17
 cxq note 42 "Found race in token refresh path"
 cxq prompt 42
 cxq review 42 --summary "Implemented lock and added regression test"
+cxq reopen 42 --reason "acceptance criteria 3 is still missing"
+cxq followup 42 "Handle the error branch" --close
+cxq finding add 42 --severity high --note "Retry loop is unbounded"
+cxq finding list 42
+cxq finding resolve 7
+cxq list --needs-action
+cxq list --questions
+cxq review-stale --older-than 24h
+cxq status-transitions
 cxq done 42
 cxq repo 42
 cxq stale
@@ -192,7 +201,9 @@ cxq release 42
 ~~~
 
 `cxq doctor` is read-only. It reports the installed version, PATH resolution,
-required tools, install metadata, update state, and current repo queue setup.
+required tools, install metadata, update state, current repo queue setup, and
+lightweight database diagnostics: schema version, task counts by status, and the
+result of `PRAGMA integrity_check`.
 
 The default workflow is:
 
@@ -260,6 +271,116 @@ preserving normal priority ordering. Self-dependencies and cycles are rejected.
 | `review` | Implementation attempted; human review needed |
 | `done` | Accepted |
 | `wontfix` | Intentionally abandoned |
+
+## Status transitions
+
+Review is a real state, not a formality, so work can move backwards. Run:
+
+~~~sh
+cxq status-transitions
+~~~
+
+to print every supported movement and the command that performs it. The table is
+the single source of truth: commands validate against it.
+
+| From | To | Command |
+| --- | --- | --- |
+| `ready` | `claimed` | `cxq claim` or `cxq claim-next` |
+| `claimed` | `ready` | `cxq release <id>` |
+| `claimed` | `review` | `cxq review <id> --summary "..."` |
+| `blocked` | `ready` | `cxq release <id>` |
+| `review` | `ready` | `cxq reopen <id> --reason "..."` |
+| `review` | `blocked` | `cxq reopen <id> --to blocked --reason "..."` |
+| `review` | `done` | `cxq done <id>` |
+| `done` | `ready` | `cxq reopen <id> --reason "..."` |
+
+`cxq release <id>` returns a `claimed` or `blocked` task to `ready`.
+
+## Reopening and follow-ups
+
+A partially accepted review has two honest outcomes: send it back, or close it
+and split off the leftover work.
+
+~~~sh
+cxq reopen 42 --reason "acceptance criteria 3 is still missing"
+cxq reopen 42 --to blocked --reason "waiting on a product decision"
+cxq followup 42 "Handle the error branch"
+cxq followup 42 "Handle the error branch" --close
+~~~
+
+`cxq reopen` requires a reason, records it as an event, clears the claim fields,
+and preserves the result summary and note history. `--to` accepts `ready`
+(default), `inbox`, or `blocked`.
+
+`cxq followup <id> <title>` (alias `cxq split`) creates a `ready` task that
+inherits the original's allowed paths, tags, priority, and verification command
+unless you override them. The follow-up is recorded as blocked by the original,
+so it becomes claimable once the original is `done`. `--close` marks the original
+`done` and notes the follow-up id in its result summary.
+
+## Findings
+
+Review outcomes are often "approve, with caveats". Findings make those caveats
+first-class instead of free text buried in a summary:
+
+~~~sh
+cxq finding add 42 --severity high --note "Retry loop is unbounded"
+cxq finding add 42 --severity low --status accepted --note "Naming nit"
+cxq finding add 42 --severity medium --note "Edge case untested" --followup 51
+cxq finding list 42
+cxq finding resolve 7
+cxq finding resolve 7 --status accepted
+~~~
+
+Severity is `low`, `medium`, `high`, or `critical`. Status is `open`, `accepted`,
+or `resolved`. `cxq show` renders a `Findings` section when a task has any.
+
+A task with open findings can still be approved, but `cxq done` will warn first.
+
+## Operational views
+
+Three read-only views cut the queue down to what needs a human:
+
+~~~sh
+cxq list --needs-action
+cxq list --questions
+cxq review-stale --older-than 24h
+~~~
+
+`--needs-action` shows `ready` and `blocked` tasks plus any `review` task
+carrying open findings. `--questions` lists notes that start with `DUDA:` or
+`BLOCKER:`, so agent questions do not get lost in the event log.
+`cxq review-stale` lists reviews nobody has touched inside the window; it
+defaults to `24h` and accepts the same `30m`/`2h`/`1d` syntax as leases.
+
+## Closing tasks
+
+`cxq done 42` accepts the task. It warns first when closing looks premature:
+
+- the result summary still mentions pending or leftover work
+- the task still has open findings
+
+Interactive runs ask for confirmation. Non-interactive runs stop and tell you to
+use `--force`. A clean close is never blocked.
+
+~~~sh
+cxq done 42 --summary "Implemented and verified"
+cxq done 42 --summary "Main flow works, docs pending" --force
+~~~
+
+## Concurrency
+
+Several agents and humans can use one queue at the same time. Both the project
+queue and the global state database run in WAL mode, every SQLite call sets a
+busy timeout, and transient `database is locked` failures are retried with a
+short backoff. Non-lock SQLite errors still fail immediately.
+
+Tuning is available but rarely needed:
+
+~~~sh
+CXQ_SQLITE_BUSY_TIMEOUT_MS=5000
+CXQ_SQLITE_MAX_ATTEMPTS=5
+~~~
 
 ## Leases
 
@@ -339,12 +460,19 @@ cxq release 0.2.1
 ~~~
 
 `cxq release prepare` verifies the requested version and writes release notes to
-`/tmp/cxq-release-vX.Y.Z.md`. `cxq release tag` creates and pushes the Git tag;
-it must run from `main` with an up-to-date upstream. `cxq release publish`
-requires `gh` and publishes the GitHub release. The full `cxq release X.Y.Z`
-path asks before publishing interactively and requires `--yes` when
-non-interactive. Use `--dry-run` to print actions without changing Git or
-GitHub.
+`/tmp/cxq-release-vX.Y.Z.md`. The draft summarizes commits since the previous
+stable `v*` tag; when no earlier tag exists it says so and treats the release as
+the first draft. Review the generated highlights before publishing.
+
+`cxq release tag` creates and pushes the Git tag. It must run from `main`, and
+local `main` must be exactly in sync with its upstream: tagging is refused when
+`main` is ahead (unpushed commits), behind, diverged, or has no upstream at all.
+Push first, then tag.
+
+`cxq release publish` requires `gh` and publishes the GitHub release. The full
+`cxq release X.Y.Z` path asks before publishing interactively and requires
+`--yes` when non-interactive. Use `--dry-run` to print actions without changing
+Git or GitHub.
 
 ## Agent contract
 
@@ -376,6 +504,12 @@ Before starting queued work:
 If `cxq` exits with update-required, run:
 `cxq update --yes`
 then retry the original command.
+
+Prefix questions in notes with `DUDA:` or `BLOCKER:` so they show up in
+`cxq list --questions`.
+
+Record review caveats with `cxq finding add <id> --severity ... --note "..."`
+instead of burying them in the summary.
 
 Never mark a task `done` unless explicitly instructed.
 ~~~

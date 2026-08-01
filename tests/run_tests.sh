@@ -20,7 +20,46 @@ current_repo_version() {
   printf '%s' "$line"
 }
 
-export CXQ_TEST_LATEST_VERSION="v$(current_repo_version)"
+current_stable_base() {
+  local version
+  version=$(current_repo_version)
+  printf '%s' "${version%-dev}"
+}
+
+# Highest stable remote tag that must never require an update for this build.
+# A stable local build matches its own tag; an X.Y.Z-dev build is newer than
+# every stable tag below X.Y.Z.
+current_uptodate_tag() {
+  local version base major minor patch
+  version=$(current_repo_version)
+  base=${version%-dev}
+  if [ "$version" = "$base" ]; then
+    printf 'v%s' "$base"
+    return
+  fi
+  IFS=. read -r major minor patch <<<"$base"
+  if [ "$((10#$patch))" -gt 0 ]; then
+    patch=$((10#$patch - 1))
+  elif [ "$((10#$minor))" -gt 0 ]; then
+    minor=$((10#$minor - 1))
+    patch=0
+  else
+    major=$((10#$major - 1))
+    minor=0
+    patch=0
+  fi
+  printf 'v%s.%s.%s' "$major" "$minor" "$patch"
+}
+
+# A dev build reports dev-build instead of up-to-date when it leads the tag.
+current_uptodate_result() {
+  case "$(current_repo_version)" in
+    *-dev) printf 'dev-build' ;;
+    *) printf 'up-to-date' ;;
+  esac
+}
+
+export CXQ_TEST_LATEST_VERSION="$(current_uptodate_tag)"
 
 cleanup() {
   rm -rf "$TEST_DIR"
@@ -76,6 +115,39 @@ run_git_init() {
   git -C "$1" config user.name "cxq test"
 }
 
+set_file_version() {
+  local file=$1
+  local version=$2
+  local tmp line
+  tmp="$file.version.tmp"
+  rm -f "$tmp"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      CXQ_VERSION=\"*\") printf 'CXQ_VERSION="%s"\n' "$version" >>"$tmp" ;;
+      *) printf '%s\n' "$line" >>"$tmp" ;;
+    esac
+  done <"$file"
+  chmod +x "$tmp"
+  mv "$tmp" "$file"
+}
+
+set_fixture_version() {
+  set_file_version "$1/bin/cxq" "$2"
+}
+
+# Copies the installed binary to a private path pinned at a given version.
+build_versioned_cxq() {
+  local name=$1
+  local version=$2
+  local dir="$TEST_DIR/versioned/$name"
+  mkdir -p "$dir"
+  cp "$CXQ" "$dir/cxq"
+  set_file_version "$dir/cxq" "$version"
+  printf '%s/cxq' "$dir"
+}
+
+# Source fixtures pin a stable version so release commands, which reject
+# X.Y.Z-dev, can be exercised while the working tree is on a dev build.
 run_source_fixture() {
   local repo=$1
   mkdir -p "$repo/bin" "$repo/tests"
@@ -83,6 +155,7 @@ run_source_fixture() {
   cp "$ROOT/install.sh" "$repo/install.sh"
   cp "$ROOT/tests/run_tests.sh" "$repo/tests/run_tests.sh"
   cp "$ROOT/README.md" "$repo/README.md"
+  set_fixture_version "$repo" "$(current_stable_base)"
   chmod +x "$repo/bin/cxq" "$repo/install.sh" "$repo/tests/run_tests.sh"
   git init -q "$repo"
   git -C "$repo" checkout -q -B main
@@ -620,10 +693,10 @@ test_update_check_runs_after_24h() {
   state_set "last_update_check_at" "1000"
   state_set "last_update_check_result" "old-result"
 
-  (cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION="v$(current_repo_version)" "$CXQ" list >/dev/null)
+  (cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION="$(current_uptodate_tag)" "$CXQ" list >/dev/null)
   result=$(state_get "last_update_check_result")
   checked_at=$(state_get "last_update_check_at")
-  assert_contains "$result" "up-to-date"
+  assert_contains "$result" "$(current_uptodate_result)"
   [ "$checked_at" = "90000" ] || fail "expected last_update_check_at to be updated"
   pass "daily update check runs after 24h"
 }
@@ -750,8 +823,8 @@ test_update_check_command() {
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
 
-  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION="v$(current_repo_version)" "$CXQ" update --check)
-  assert_contains "$output" "up-to-date: v$(current_repo_version)"
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION="$(current_uptodate_tag)" "$CXQ" update --check)
+  assert_contains "$output" "$(current_uptodate_result)"
   assert_contains "$output" "No update required."
   pass "update --check records remote check result"
 }
@@ -762,7 +835,7 @@ test_plain_update_current() {
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
 
-  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION="v$(current_repo_version)" "$CXQ" update)
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION="$(current_uptodate_tag)" "$CXQ" update)
   assert_contains "$output" "cxq is up to date: $(current_repo_version)"
   pass "plain cxq update is the current-version happy path"
 }
@@ -807,7 +880,7 @@ test_update_aliases() {
 
   output=$(cd "$repo" && "$CXQ" --status)
   assert_contains "$output" "current_version: $(current_repo_version)"
-  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION="v$(current_repo_version)" "$CXQ" --check)
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION="$(current_uptodate_tag)" "$CXQ" --check)
   assert_contains "$output" "No update required."
   pass "top-level update aliases work"
 }
@@ -825,7 +898,7 @@ test_update_self_clears_state_without_shell_error() {
   state_set "update_required" "1"
   state_set "update_required_kind" "self"
   state_set "update_required_reason" "test self update"
-  state_set "latest_version" "v$(current_repo_version)"
+  state_set "latest_version" "$(current_uptodate_tag)"
 
   set +e
   output=$(cd "$repo" && CXQ_TEST_SKIP_SELF_UPDATE_GIT=1 "$CXQ" update --yes 2>&1)
@@ -833,7 +906,7 @@ test_update_self_clears_state_without_shell_error() {
   set -e
   [ "$status" -eq 0 ] || fail "self update should succeed. Output: $output"
   assert_file "$target_prefix/bin/cxq"
-  assert_contains "$output" "cxq is now up to date: v$(current_repo_version)"
+  assert_contains "$output" "cxq is now up to date: $(current_uptodate_tag)"
   assert_not_contains "$output" "command not found"
   [ "$(state_get "update_required")" = "0" ] || fail "self update should clear update_required"
   [ -z "$(state_get "update_required_kind")" ] || fail "self update should clear update_required_kind"
@@ -1095,6 +1168,424 @@ test_commands_work_from_repo_subdirectory_after_install() {
   pass "queue commands work from subdirectories after install"
 }
 
+test_dev_version_update_comparisons() {
+  local repo dev output
+  repo="$TEST_DIR/dev-version-updates"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  dev=$(build_versioned_cxq "dev" "1.2.3-dev")
+
+  assert_contains "$("$dev" version --plain)" "1.2.3-dev"
+
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v1.2.2 "$dev" update --check)
+  assert_contains "$output" "dev-build: 1.2.3-dev is ahead of latest stable v1.2.2"
+  assert_contains "$output" "No update required."
+  [ "$(state_get "update_required")" != "1" ] || fail "older stable tag should not gate a dev build"
+
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v1.2.3 "$dev" update --check)
+  assert_contains "$output" "update-available: v1.2.3"
+  [ "$(state_get "update_required")" = "1" ] || fail "released stable tag should supersede the matching dev build"
+
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v1.3.0 "$dev" update --check)
+  assert_contains "$output" "update-available: v1.3.0"
+  [ "$(state_get "update_required")" = "1" ] || fail "newer stable tag should still require an update from a dev build"
+
+  output=$(cd "$repo" && CXQ_TEST_LATEST_VERSION=v9.9.9-alpha.1 "$dev" update --check)
+  assert_contains "$output" "ok: no stable tags found"
+  [ "$(state_get "update_required")" != "1" ] || fail "remote prerelease tags must stay ignored for dev builds"
+
+  state_set "update_required" "0"
+  state_set "update_required_kind" ""
+  state_set "update_required_reason" ""
+  pass "dev versions compare correctly against stable remote tags"
+}
+
+test_release_notes_summarize_commits() {
+  local repo version notes content root_commit
+  repo="$TEST_DIR/release-notes"
+  run_source_fixture "$repo"
+  version=$(fixture_version "$repo")
+  notes="/tmp/cxq-release-v$version.md"
+
+  rm -f "$notes"
+  (cd "$repo" && "$CXQ" release prepare "$version" --skip-tests >/dev/null)
+  content=$(cat "$notes")
+  assert_contains "$content" "First release draft"
+  grep -q '~~~sh' "$notes" || fail "release notes should use tildes fences"
+  ! grep -q '```' "$notes" || fail "release notes should not use triple backtick fences"
+
+  root_commit=$(git -C "$repo" rev-list --max-parents=0 HEAD)
+  git -C "$repo" tag "v0.0.1" "$root_commit"
+  printf 'change\n' >"$repo/change.txt"
+  git -C "$repo" add change.txt
+  git -C "$repo" commit -q -m "feat: summarize commits in release notes"
+
+  rm -f "$notes"
+  (cd "$repo" && "$CXQ" release prepare "$version" --skip-tests >/dev/null)
+  content=$(cat "$notes")
+  assert_contains "$content" "Changes since v0.0.1"
+  assert_contains "$content" "- feat: summarize commits in release notes"
+  assert_not_contains "$content" "First release draft"
+  grep -q '~~~sh' "$notes" || fail "release notes should keep tildes fences"
+  ! grep -q '```' "$notes" || fail "release notes should not use triple backtick fences"
+  pass "release prepare summarizes commits since the previous stable tag"
+}
+
+test_release_tag_rejects_unpushed_main() {
+  local repo remote version output status
+  repo="$TEST_DIR/release-ahead"
+  remote="$TEST_DIR/release-ahead-origin.git"
+  run_source_fixture "$repo"
+  attach_source_fixture_upstream "$repo" "$remote"
+  version=$(fixture_version "$repo")
+
+  printf 'local only\n' >"$repo/unpushed.txt"
+  git -C "$repo" add unpushed.txt
+  git -C "$repo" commit -q -m "local only commit"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" release tag "$version" --dry-run --skip-tests 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "release tag should fail when main is ahead of upstream"
+  assert_contains "$output" "unpushed commits"
+  assert_contains "$output" "push before releasing"
+  ! git -C "$repo" rev-parse -q --verify "refs/tags/v$version" >/dev/null || fail "no tag should be created"
+  pass "release tag refuses unpushed main"
+}
+
+test_doctor_reports_repo_database() {
+  local repo output
+  repo="$TEST_DIR/doctor-db"
+  run_git_init "$repo"
+
+  output=$(cd "$repo" && "$CXQ" doctor)
+  assert_contains "$output" "repo_queue_installed: no"
+  assert_contains "$output" "repo_db: none"
+  assert_contains "$output" "repo_schema_version: none"
+  assert_contains "$output" "repo_db_integrity: none"
+  assert_not_exists "$repo/.codex"
+
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  (cd "$repo" && "$CXQ" add "Doctor sample" >/dev/null)
+  output=$(cd "$repo" && "$CXQ" doctor)
+  assert_contains "$output" "/doctor-db/.codex/tasks.db"
+  assert_contains "$output" "repo_schema_version: 3 (expected 3)"
+  assert_contains "$output" "repo_task_total: 1"
+  assert_contains "$output" "repo_task_counts: ready=1"
+  assert_contains "$output" "repo_db_integrity: ok"
+
+  output=$(cd "$repo" && "$CXQ" list)
+  assert_contains "$output" "Doctor sample" "doctor must not mutate queue rows"
+  pass "doctor reports repo database diagnostics"
+}
+
+test_status_transitions_table_and_release() {
+  local repo output id status
+  repo="$TEST_DIR/status-transitions"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  output=$(cd "$repo" && "$CXQ" status-transitions)
+  assert_contains "$output" "# cxq status transitions"
+  assert_contains "$output" "review    ready"
+  assert_contains "$output" "review    blocked"
+  assert_contains "$output" "claimed   ready"
+  assert_contains "$output" "done      ready"
+  assert_contains "$output" "cxq release <id>"
+
+  id=$(cd "$repo" && "$CXQ" add "Transition sample" | sed 's/.*#//')
+  set +e
+  output=$(cd "$repo" && "$CXQ" release "$id" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "release should reject a ready task"
+  assert_contains "$output" "not claimed or blocked"
+  assert_contains "$output" "cxq status-transitions"
+
+  (cd "$repo" && "$CXQ" reopen "$id" --to blocked --reason "waiting on product" >/dev/null)
+  output=$(cd "$repo" && "$CXQ" release "$id")
+  assert_contains "$output" "Released task #$id"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $id;")" = "ready" ] ||
+    fail "release from blocked should return the task to ready"
+  pass "status transitions are documented and release accepts blocked tasks"
+}
+
+test_reopen_returns_tasks_to_ready() {
+  local repo id output status summary
+  repo="$TEST_DIR/reopen"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  id=$(cd "$repo" && "$CXQ" add "Reopen sample" | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" claim "$id" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" note "$id" "Found a race in the refresh path" >/dev/null)
+  (cd "$repo" && "$CXQ" review "$id" --summary "Partially implemented" >/dev/null)
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" reopen "$id" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "reopen should require a reason"
+  assert_contains "$output" "reopen reason is required"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" reopen "$id" --to done --reason "nope" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "reopen should reject invalid targets"
+  assert_contains "$output" "reopen target must be ready, inbox, or blocked"
+
+  output=$(cd "$repo" && "$CXQ" reopen "$id" --reason "acceptance criteria 3 is missing")
+  assert_contains "$output" "Reopened task #$id: review -> ready"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $id;")" = "ready" ] ||
+    fail "reopen should move the task back to ready"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")" = "1" ] ||
+    fail "reopen should clear claim fields"
+
+  summary=$(cd "$repo" && "$CXQ" show "$id")
+  assert_contains "$summary" "Partially implemented" "reopen must preserve the result summary"
+  assert_contains "$summary" "Found a race in the refresh path" "reopen must preserve prior notes"
+  assert_contains "$summary" "acceptance criteria 3 is missing" "reopen must record the reason"
+
+  (cd "$repo" && "$CXQ" done "$id" --summary "Accepted" >/dev/null)
+  output=$(cd "$repo" && "$CXQ" reopen "$id" --to inbox --reason "regression reported")
+  assert_contains "$output" "Reopened task #$id: done -> inbox"
+  pass "reopen returns review and done tasks to an actionable status"
+}
+
+test_followup_links_residual_work() {
+  local repo parent child output next_id
+  repo="$TEST_DIR/followup"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  parent=$(cd "$repo" && "$CXQ" add "Original work" --priority 70 --files "src/a,src/b" --tag auth --verify "make check" | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" claim "$parent" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" review "$parent" --summary "Main path done" >/dev/null)
+
+  output=$(cd "$repo" && "$CXQ" followup "$parent" "Handle the error branch")
+  assert_contains "$output" "Created follow-up task #"
+  child=${output#*follow-up task #}
+  child=${child%% *}
+
+  output=$(cd "$repo" && "$CXQ" show "$child")
+  assert_contains "$output" "Follow-up of task #$parent"
+  assert_contains "$output" "src/a" "follow-up should inherit allowed paths"
+  assert_contains "$output" "auth" "follow-up should inherit tags"
+  assert_contains "$output" "make check" "follow-up should inherit the verify command"
+  assert_contains "$output" "#$parent [review] Original work" "follow-up should record the parent as a blocker"
+
+  output=$(cd "$repo" && "$CXQ" show "$parent")
+  assert_contains "$output" "#$child [ready] Handle the error branch" "parent should list the follow-up"
+
+  set +e
+  next_id=$(cd "$repo" && "$CXQ" next --format id 2>&1)
+  set -e
+  assert_contains "$next_id" "No ready tasks." "an open parent should still block its follow-up"
+
+  output=$(cd "$repo" && "$CXQ" split "$parent" "Close it out" --close --priority 40)
+  assert_contains "$output" "Created follow-up task #"
+  assert_contains "$output" "Closed task #$parent with follow-up #"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $parent;")" = "done" ] ||
+    fail "--close should mark the original done"
+  output=$(cd "$repo" && "$CXQ" show "$parent")
+  assert_contains "$output" "Closed with follow-up #" "closing summary should mention the follow-up"
+  pass "followup creates linked residual work and can close the original"
+}
+
+test_findings_lifecycle() {
+  local repo id followup output finding status
+  repo="$TEST_DIR/findings"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  id=$(cd "$repo" && "$CXQ" add "Reviewed work" | sed 's/.*#//')
+  followup=$(cd "$repo" && "$CXQ" add "Fix the finding later" | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" claim "$id" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" review "$id" --summary "Ready for review" >/dev/null)
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" finding add "$id" --severity nope --note "bad" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "invalid severity should be rejected"
+  assert_contains "$output" "finding severity must be"
+
+  output=$(cd "$repo" && "$CXQ" finding add "$id" --severity high --status open --note "Retry loop is unbounded" --followup "$followup")
+  assert_contains "$output" "Added finding #"
+  finding=${output#*finding #}
+  finding=${finding%% *}
+
+  output=$(cd "$repo" && "$CXQ" finding list "$id")
+  assert_contains "$output" "high"
+  assert_contains "$output" "Retry loop is unbounded"
+  assert_contains "$output" "$followup"
+
+  output=$(cd "$repo" && "$CXQ" show "$id")
+  assert_contains "$output" "## Findings"
+  assert_contains "$output" "[high/open] Retry loop is unbounded"
+  assert_contains "$output" "(follow-up #$followup)"
+
+  output=$(cd "$repo" && "$CXQ" finding resolve "$finding" --note "bounded in #$followup")
+  assert_contains "$output" "Marked finding #$finding as resolved"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" finding resolve "$finding" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "resolving a closed finding should fail"
+  assert_contains "$output" "is not open"
+
+  output=$(cd "$repo" && "$CXQ" show "$id")
+  assert_contains "$output" "[high/resolved] Retry loop is unbounded"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "3" ] ||
+    fail "findings require schema version 3"
+  pass "findings can be added, listed, rendered, and resolved"
+}
+
+test_operational_views() {
+  local repo ready blocked reviewed clean stale_id output
+  repo="$TEST_DIR/views"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  ready=$(cd "$repo" && "$CXQ" add "Needs work now" --priority 90 | sed 's/.*#//')
+  blocked=$(cd "$repo" && "$CXQ" add "Waiting on product" --priority 80 | sed 's/.*#//')
+  reviewed=$(cd "$repo" && "$CXQ" add "Review with findings" --priority 70 | sed 's/.*#//')
+  clean=$(cd "$repo" && "$CXQ" add "Review without findings" --priority 60 | sed 's/.*#//')
+
+  (cd "$repo" && "$CXQ" reopen "$blocked" --to blocked --reason "needs a decision" >/dev/null)
+  for stale_id in "$reviewed" "$clean"; do
+    (cd "$repo" && "$CXQ" claim "$stale_id" --agent codex --lease 1h >/dev/null)
+    (cd "$repo" && "$CXQ" review "$stale_id" --summary "Please review" >/dev/null)
+  done
+  (cd "$repo" && "$CXQ" finding add "$reviewed" --severity medium --note "Edge case is untested" >/dev/null)
+
+  output=$(cd "$repo" && "$CXQ" list --needs-action)
+  assert_contains "$output" "Needs work now"
+  assert_contains "$output" "Waiting on product"
+  assert_contains "$output" "Review with findings"
+  assert_not_contains "$output" "Review without findings" "clean reviews are not pending action"
+
+  (cd "$repo" && "$CXQ" note "$ready" "DUDA: which token store should we use?" >/dev/null)
+  (cd "$repo" && "$CXQ" note "$blocked" "BLOCKER: waiting on the vendor contract" >/dev/null)
+  (cd "$repo" && "$CXQ" note "$clean" "Regular progress note" >/dev/null)
+
+  output=$(cd "$repo" && "$CXQ" list --questions)
+  assert_contains "$output" "DUDA: which token store should we use?"
+  assert_contains "$output" "BLOCKER: waiting on the vendor contract"
+  assert_not_contains "$output" "Regular progress note" "plain notes are not questions"
+
+  output=$(cd "$repo" && "$CXQ" review-stale)
+  assert_not_contains "$output" "Review with findings" "fresh reviews are not stale after 24h"
+
+  sqlite3 -batch "$repo/.codex/tasks.db" "DROP TRIGGER IF EXISTS trg_tasks_updated_at; UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-48 hours') WHERE id = $reviewed;"
+
+  output=$(cd "$repo" && "$CXQ" review-stale)
+  assert_contains "$output" "Review with findings"
+  assert_not_contains "$output" "Review without findings" "only stale reviews are listed"
+
+  output=$(cd "$repo" && "$CXQ" review-stale --older-than 3d)
+  assert_not_contains "$output" "Review with findings" "a longer window should exclude the 48h review"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" review-stale --older-than 24 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "review-stale should reject malformed durations"
+  assert_contains "$output" "--older-than must look like 30m, 2h, or 1d"
+  pass "operational views surface pending action, questions, and stale reviews"
+}
+
+test_done_warns_about_unfinished_work() {
+  local repo pending clean withfinding output status
+  repo="$TEST_DIR/done-warnings"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  pending=$(cd "$repo" && "$CXQ" add "Pending work task" | sed 's/.*#//')
+  clean=$(cd "$repo" && "$CXQ" add "Clean task" | sed 's/.*#//')
+  withfinding=$(cd "$repo" && "$CXQ" add "Task with finding" | sed 's/.*#//')
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" done "$pending" --summary "Main flow works, docs are still pending" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "done should refuse a summary that mentions pending work"
+  assert_contains "$output" "may not be finished"
+  assert_contains "$output" "the summary still mentions pending work"
+  assert_contains "$output" "cxq done $pending --force"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $pending;")" != "done" ] ||
+    fail "a warned task must not be closed without --force"
+
+  output=$(cd "$repo" && "$CXQ" done "$pending" --summary "Main flow works, docs are still pending" --force)
+  assert_contains "$output" "Marked task #$pending done"
+
+  (cd "$repo" && "$CXQ" finding add "$withfinding" --severity high --note "Auth bypass on refresh" >/dev/null)
+  set +e
+  output=$(cd "$repo" && "$CXQ" done "$withfinding" --summary "Shipped" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "done should refuse a task with open findings"
+  assert_contains "$output" "1 open finding(s)"
+
+  set +e
+  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=n "$CXQ" done "$withfinding" --summary "Shipped" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "answering no should abort an interactive close"
+  assert_contains "$output" "Mark task #$withfinding done anyway? [y/N]"
+  assert_contains "$output" "was not closed"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $withfinding;")" != "done" ] ||
+    fail "answering no must leave the task open"
+
+  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=y "$CXQ" done "$withfinding" --summary "Shipped" 2>&1)
+  assert_contains "$output" "Marked task #$withfinding done"
+
+  output=$(cd "$repo" && "$CXQ" done "$clean" --summary "Implemented and verified")
+  assert_contains "$output" "Marked task #$clean done"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $clean;")" = "done" ] ||
+    fail "a clean close must never be blocked"
+  pass "done warns before closing tasks with unfinished work"
+}
+
+test_concurrent_commands_do_not_lock() {
+  local repo id i output status pids pid combined
+  repo="$TEST_DIR/concurrency"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  id=$(cd "$repo" && "$CXQ" add "Concurrency subject" | sed 's/.*#//')
+
+  rm -rf "$TEST_DIR/concurrency-out"
+  mkdir -p "$TEST_DIR/concurrency-out"
+
+  pids=""
+  for i in 1 2 3 4 5 6; do
+    (cd "$repo" && "$CXQ" show "$id" >"$TEST_DIR/concurrency-out/show-$i.log" 2>&1) &
+    pids="$pids $!"
+    (cd "$repo" && "$CXQ" add "Parallel task $i" >"$TEST_DIR/concurrency-out/add-$i.log" 2>&1) &
+    pids="$pids $!"
+    (cd "$repo" && "$CXQ" note "$id" "parallel note $i" >"$TEST_DIR/concurrency-out/note-$i.log" 2>&1) &
+    pids="$pids $!"
+  done
+
+  status=0
+  for pid in $pids; do
+    wait "$pid" || status=1
+  done
+
+  combined=$(cat "$TEST_DIR"/concurrency-out/*.log)
+  assert_not_contains "$combined" "database is locked" "concurrent commands must not fail on SQLite locks"
+  [ "$status" -eq 0 ] || fail "concurrent cxq commands should all succeed. Output: $combined"
+
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title LIKE 'Parallel task %';")" = "6" ] ||
+    fail "every concurrent add should be recorded"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $id AND event_type = 'note';")" = "6" ] ||
+    fail "every concurrent note should be recorded"
+  pass "concurrent reads and writes do not hit database locks"
+}
+
 test_installer_and_version
 test_installer_defaults_to_home_local
 test_installer_explicit_prefix_and_old_binary_warning
@@ -1144,5 +1635,16 @@ test_release_tag_checks_upstream_state
 test_release_prepare_rejects_mismatch_and_existing_tag
 test_release_publish_requires_yes_noninteractive_and_source_repo
 test_commands_work_from_repo_subdirectory_after_install
+test_dev_version_update_comparisons
+test_release_notes_summarize_commits
+test_release_tag_rejects_unpushed_main
+test_doctor_reports_repo_database
+test_status_transitions_table_and_release
+test_reopen_returns_tasks_to_ready
+test_followup_links_residual_work
+test_findings_lifecycle
+test_operational_views
+test_done_warns_about_unfinished_work
+test_concurrent_commands_do_not_lock
 
 printf '\n%s tests passed\n' "$PASS"

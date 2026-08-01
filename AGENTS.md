@@ -124,6 +124,15 @@ and only after that create the tag/release.
 
 If the updater compares local version against remote tags, dev versions should not masquerade as published stable releases.
 
+Update comparison policy for dev versions:
+
+- `X.Y.Z-dev` sorts strictly below the stable `X.Y.Z` it is working towards.
+- A remote stable tag below `X.Y.Z` never gates a local `X.Y.Z-dev` build. The
+  check reports `dev-build: ... is ahead of latest stable ...`.
+- A remote stable tag equal to or above `X.Y.Z` does require an update, so a dev
+  build never masks a real published release.
+- Remote prerelease tags are still ignored entirely.
+
 ## Commit message guidance
 
 Use Conventional Commits-style messages when suggesting commits.
@@ -276,7 +285,21 @@ Use SQLite carefully.
 - Do not delete `.codex/tasks.db` unless explicitly instructed.
 - Store schema version with `PRAGMA user_version` when applicable.
 - Store task dependencies in `task_dependencies`; do not rely on `deps_json` for claimability.
+- Store review findings in `task_findings`; do not encode them in `result_summary`.
 - Keep event history append-only when possible.
+
+## Concurrency policy
+
+Several agents and humans may use one queue at the same time.
+
+- Route every `sqlite3` call through the `sqlite_run` helper. Do not call
+  `sqlite3` directly.
+- `sqlite_run` sets a busy timeout, retries transient `database is locked`
+  failures with a short backoff, and fails immediately on any other error.
+- Keep WAL mode on for both the project queue and `~/.cxq/state.db`.
+- Defaults are `CXQ_SQLITE_BUSY_TIMEOUT_MS=5000` and `CXQ_SQLITE_MAX_ATTEMPTS=5`.
+  Both are overridable by environment variable.
+- Do not add long-running transactions that hold write locks across shell work.
 
 ## Shell portability
 
