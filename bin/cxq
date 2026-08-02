@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CXQ_VERSION="0.3.0-dev"
+CXQ_VERSION="0.3.0"
 CXQ_REPO_SCHEMA_VERSION="3"
 CXQ_DEFAULT_REMOTE_URL="https://github.com/daniel-aranda/Agents-todo.git"
 CXQ_SQLITE_BUSY_TIMEOUT_MS="${CXQ_SQLITE_BUSY_TIMEOUT_MS:-5000}"
