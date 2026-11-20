@@ -6,6 +6,9 @@ It is not a project manager, kanban board, or issue tracker. It is a repo-local
 SQLite queue with a small command-line interface, designed so humans and agents
 can coordinate implementation work without editing ad hoc TODO files.
 
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/174b46e1-0048-4f17-8514-e53256d0b6bd" />
+
+
 The intended flow is simple:
 
 ~~~sh
