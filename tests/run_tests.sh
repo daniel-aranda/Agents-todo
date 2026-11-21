@@ -1270,7 +1270,7 @@ test_doctor_reports_repo_database() {
   (cd "$repo" && "$CXQ" add "Doctor sample" >/dev/null)
   output=$(cd "$repo" && "$CXQ" doctor)
   assert_contains "$output" "/doctor-db/.codex/tasks.db"
-  assert_contains "$output" "repo_schema_version: 3 (expected 3)"
+  assert_contains "$output" "repo_schema_version: 4 (expected 4)"
   assert_contains "$output" "repo_task_total: 1"
   assert_contains "$output" "repo_task_counts: ready=1"
   assert_contains "$output" "repo_db_integrity: ok"
@@ -1439,8 +1439,8 @@ test_findings_lifecycle() {
 
   output=$(cd "$repo" && "$CXQ" show "$id")
   assert_contains "$output" "[high/resolved] Retry loop is unbounded"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "3" ] ||
-    fail "findings require schema version 3"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
+    fail "findings require schema version 4"
   pass "findings can be added, listed, rendered, and resolved"
 }
 
@@ -1586,6 +1586,472 @@ test_concurrent_commands_do_not_lock() {
   pass "concurrent reads and writes do not hit database locks"
 }
 
+
+test_edit_updates_fields_and_logs_diff() {
+  local repo id output
+  repo="$TEST_DIR/edit"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  id=$(cd "$repo" && "$CXQ" add "Original title" --priority 50 --tag alpha --files "src/a" --acceptance "old criteria" --verify "make check" | sed 's/.*#//')
+
+  output=$(cd "$repo" && "$CXQ" edit "$id" --title "New title" --body "New body" --priority 90 --acceptance "new criteria" --verify "make test" --branch feature/x --due 2026-12-01)
+  assert_contains "$output" "Edited task #$id"
+  assert_contains "$output" "title: Original title -> New title"
+  assert_contains "$output" "priority: 50 -> 90"
+  assert_contains "$output" "due_date: (empty) -> 2026-12-01"
+
+  output=$(cd "$repo" && "$CXQ" show "$id")
+  assert_contains "$output" "New title"
+  assert_contains "$output" "New body"
+  assert_contains "$output" "2026-12-01"
+  assert_contains "$output" "feature/x"
+  assert_contains "$output" "## Edit history"
+  assert_contains "$output" "title: Original title -> New title"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $id AND event_type = 'edited';")" = "1" ] ||
+    fail "one edit must log exactly one edited event"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT due_date FROM tasks WHERE id = $id;")" = "2026-12-01" ] ||
+    fail "due_date must be stored"
+
+  # files/tags add + remove, and --due-clear
+  output=$(cd "$repo" && "$CXQ" edit "$id" --files-add "src/b" --tags-add beta --tags-remove alpha --due-clear)
+  assert_contains "$output" "allowed_paths: src/a -> src/a,src/b"
+  assert_contains "$output" "tags: alpha -> beta"
+  assert_contains "$output" "due_date: 2026-12-01 -> (empty)"
+  output=$(cd "$repo" && "$CXQ" show "$id")
+  assert_contains "$output" "src/b"
+  assert_contains "$output" "beta"
+  # The cleared date stays in the edit history (that is the audit trail),
+  # but the Due date section itself must now be empty.
+  printf '%s' "$output" | grep -A1 '^## Due date$' | grep -q '^None$' ||
+    fail "due-clear must leave the Due date section empty (show output was: $output)"
+  pass "edit updates fields and logs one diff event"
+}
+
+test_edit_rejects_bad_input() {
+  local repo id output status
+  repo="$TEST_DIR/edit-rejects"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  id=$(cd "$repo" && "$CXQ" add "Edit target" --priority 50 | sed 's/.*#//')
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "edit with no flags must fail"
+  assert_contains "$output" "at least one change flag"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" --title "Edit target" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "a no-op edit must fail"
+  assert_contains "$output" "made no changes"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" --due 2026-02-30 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "an impossible due date must fail"
+  assert_contains "$output" "due date must be a valid YYYY-MM-DD date"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" --due 01-12-2026 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "a non-ISO due date must fail"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" --priority notanumber 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "a non-integer priority must fail"
+  assert_contains "$output" "priority must be an integer"
+
+  # Illegal status transition: ready -> done is not in the table.
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" --status done 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "edit must reject illegal status transitions"
+  assert_contains "$output" "cannot move task $id from ready to done"
+
+  # Legal transition out of review requires a reason.
+  (cd "$repo" && "$CXQ" claim "$id" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" review "$id" --summary "done-ish" >/dev/null)
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" --status ready 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "moving out of review without a reason must fail"
+  assert_contains "$output" "requires --reason"
+
+  output=$(cd "$repo" && "$CXQ" edit "$id" --status ready --reason "criteria missing")
+  assert_contains "$output" "status: review -> ready"
+  assert_contains "$output" "reason: criteria missing"
+  pass "edit rejects no-ops, bad dates, bad priorities, and illegal transitions"
+}
+
+test_delete_guardrails() {
+  local repo ready claimed output status
+  repo="$TEST_DIR/delete"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  ready=$(cd "$repo" && "$CXQ" add "Deletable" | sed 's/.*#//')
+  claimed=$(cd "$repo" && "$CXQ" add "Claimed task" | sed 's/.*#//')
+  inbox=$(cd "$repo" && "$CXQ" add "Inbox task" --status inbox | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" claim "$claimed" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" note "$ready" "a note to cascade" >/dev/null)
+  (cd "$repo" && "$CXQ" finding add "$ready" --severity low --note "nit" >/dev/null)
+
+  # A ready task is outside the deletable statuses, so the status guard fires.
+  set +e
+  output=$(cd "$repo" && "$CXQ" delete "$ready" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "a ready task must not be deletable without --force"
+  assert_contains "$output" "only inbox, wontfix, or done"
+
+  # An inbox task is deletable in principle, but non-interactive runs still
+  # require --force (a TTY would ask for confirmation instead).
+  set +e
+  output=$(cd "$repo" && "$CXQ" delete "$inbox" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "non-interactive delete without --force must fail"
+  assert_contains "$output" "requires --force"
+
+  # A claimed task cannot be deleted even with the status guard, without --force.
+  set +e
+  output=$(cd "$repo" && "$CXQ" delete "$claimed" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "a claimed task must not be deletable without --force"
+  assert_contains "$output" "only inbox, wontfix, or done"
+
+  output=$(cd "$repo" && "$CXQ" delete "$ready" --force)
+  assert_contains "$output" "Deleted task #$ready"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $ready;")" = "0" ] ||
+    fail "deleted task must be gone"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $ready;")" = "0" ] ||
+    fail "delete must cascade events"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_findings WHERE task_id = $ready;")" = "0" ] ||
+    fail "delete must cascade findings"
+
+  output=$(cd "$repo" && "$CXQ" remove "$claimed" --force)
+  assert_contains "$output" "Deleted task #$claimed" "remove must be an alias of delete"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" delete 999 --force 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "deleting a missing task must fail"
+  assert_contains "$output" "task not found: 999"
+  pass "delete enforces status guardrails, --force, and cascades"
+}
+
+test_board_stats_activity() {
+  local repo a b c output
+  repo="$TEST_DIR/visibility"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  a=$(cd "$repo" && "$CXQ" add "Overdue ready" --priority 90 --due 2000-01-01 | sed 's/.*#//')
+  b=$(cd "$repo" && "$CXQ" add "Future ready" --priority 80 --due 2999-01-01 | sed 's/.*#//')
+  c=$(cd "$repo" && "$CXQ" add "Claimed one" --priority 70 | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" claim "$c" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" block "$b" --by "$a" >/dev/null)
+
+  output=$(cd "$repo" && "$CXQ" board)
+  assert_contains "$output" "## ready (2)"
+  assert_contains "$output" "## claimed (1)"
+  assert_contains "$output" "Overdue ready OVERDUE (due 2000-01-01)"
+  assert_contains "$output" "Future ready due 2999-01-01"
+
+  output=$(cd "$repo" && "$CXQ" stats)
+  assert_contains "$output" "tasks_total: 3"
+  assert_contains "$output" "status_ready: 2"
+  assert_contains "$output" "status_claimed: 1"
+  assert_contains "$output" "overdue: 1"
+  assert_contains "$output" "oldest_ready: #$a Overdue ready"
+  assert_contains "$output" "done_last_7d: 0"
+  assert_contains "$output" "top_blockers:"
+  assert_contains "$output" "Overdue ready blocks 1 task(s)"
+
+  output=$(cd "$repo" && "$CXQ" activity --limit 2)
+  assert_contains "$output" "blocked_by"
+  assert_contains "$output" "claimed"
+
+  output=$(cd "$repo" && "$CXQ" activity)
+  assert_contains "$output" "created"
+  pass "board, stats, and activity render counts, overdue, and blockers"
+}
+
+test_list_filters_and_formats() {
+  local repo a b output
+  repo="$TEST_DIR/list-filters"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  a=$(cd "$repo" && "$CXQ" add "Alpha auth work" --priority 90 --tag auth --due 2000-01-01 | sed 's/.*#//')
+  b=$(cd "$repo" && "$CXQ" add "Beta billing work" --priority 40 --tag billing --due 2999-01-01 | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" claim "$b" --agent mira --lease 1h >/dev/null)
+
+  output=$(cd "$repo" && "$CXQ" list --tag auth)
+  assert_contains "$output" "Alpha auth work"
+  assert_not_contains "$output" "Beta billing work"
+
+  output=$(cd "$repo" && "$CXQ" list --agent mira)
+  assert_contains "$output" "Beta billing work"
+  assert_not_contains "$output" "Alpha auth work"
+
+  output=$(cd "$repo" && "$CXQ" list --priority-min 80)
+  assert_contains "$output" "Alpha auth work"
+  assert_not_contains "$output" "Beta billing work"
+
+  output=$(cd "$repo" && "$CXQ" list --search billing)
+  assert_contains "$output" "Beta billing work"
+  assert_not_contains "$output" "Alpha auth work"
+
+  output=$(cd "$repo" && "$CXQ" list --overdue)
+  assert_contains "$output" "Alpha auth work"
+  assert_not_contains "$output" "Beta billing work"
+
+  output=$(cd "$repo" && "$CXQ" list --due-before 2025-01-01)
+  assert_contains "$output" "Alpha auth work"
+  assert_not_contains "$output" "Beta billing work"
+
+  output=$(cd "$repo" && "$CXQ" list --format json)
+  assert_contains "$output" '"title":"Alpha auth work"'
+  assert_contains "$output" '"due_date":"2000-01-01"'
+
+  output=$(cd "$repo" && "$CXQ" list --format md)
+  assert_contains "$output" "| id | status | priority | title |"
+  assert_contains "$output" "Alpha auth work"
+
+  # Default output keeps the legacy column set (no due_date column appears
+  # without the new flags); sqlite -column pads widths to the widest value,
+  # so assert on the columns, not on exact inter-column spacing.
+  output=$(cd "$repo" && "$CXQ" list)
+  assert_contains "$output" "claimed_by"
+  assert_contains "$output" "lease_until"
+  assert_not_contains "$output" "due_date"
+  pass "list filters, search, overdue, and json/md formats work"
+}
+
+test_export_and_watch() {
+  local repo id output status
+  repo="$TEST_DIR/export"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  id=$(cd "$repo" && "$CXQ" add "Exportable task" --priority 70 --due 2999-01-01 | sed 's/.*#//')
+
+  output=$(cd "$repo" && "$CXQ" export-md)
+  assert_contains "$output" "# cxq board"
+  assert_contains "$output" "## ready (1)"
+  assert_contains "$output" "Exportable task"
+
+  output=$(cd "$repo" && "$CXQ" export --format json)
+  assert_contains "$output" '"title":"Exportable task"'
+
+  output=$(cd "$repo" && "$CXQ" export --format csv)
+  assert_contains "$output" "id,title,body,status,priority,due_date"
+  assert_contains "$output" "Exportable task"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" export --format yaml 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "export must reject unknown formats"
+  assert_contains "$output" "export format must be json or csv"
+
+  output=$(cd "$repo" && timeout 3 "$CXQ" watch --interval 1s 2>&1 || true)
+  assert_contains "$output" "# cxq board"
+  assert_contains "$output" "Exportable task"
+  pass "export-md, export json/csv, and watch render the board"
+}
+
+# Builds a hand-made schema-v3 queue DB (no due_date column, meta = 3).
+build_v3_db() {
+  local repo=$1
+  mkdir -p "$repo/.codex/prompts"
+  printf 'x\n' >"$repo/.codex/prompts/task.md"
+  printf '## Local task queue\n\nUse cxq.\n' >"$repo/AGENTS.md"
+  printf -- "-- old stock v1 schema template\nVALUES ('schema_version', '1');\n" >"$repo/.codex/tasks.schema.sql"
+  sqlite3 -batch "$repo/.codex/tasks.db" "
+CREATE TABLE tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,body TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'inbox',priority INTEGER NOT NULL DEFAULT 50,repo_path TEXT NOT NULL,branch TEXT,allowed_paths_json TEXT NOT NULL DEFAULT '[]',tags_json TEXT NOT NULL DEFAULT '[]',deps_json TEXT NOT NULL DEFAULT '[]',acceptance TEXT NOT NULL DEFAULT '',verify_command TEXT NOT NULL DEFAULT '',claimed_by TEXT,claimed_at TEXT,lease_until TEXT,result_summary TEXT NOT NULL DEFAULT '',transcript_path TEXT,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE task_events(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER NOT NULL,event_type TEXT NOT NULL,actor TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',data_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE task_dependencies(task_id INTEGER NOT NULL,blocker_task_id INTEGER NOT NULL,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),PRIMARY KEY(task_id,blocker_task_id));
+CREATE TABLE task_findings(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER NOT NULL,severity TEXT NOT NULL DEFAULT 'medium',status TEXT NOT NULL DEFAULT 'open',note TEXT NOT NULL DEFAULT '',followup_task_id INTEGER,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE cxq_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+INSERT INTO cxq_meta VALUES('schema_version','3');
+INSERT INTO tasks(title,status,priority,repo_path) VALUES('Legacy task','ready',70,'$repo');
+INSERT INTO task_events(task_id,event_type,actor,note) VALUES(1,'created','tester','Legacy task');
+"
+}
+
+test_schema_migration_v3_to_v4() {
+  local repo output
+  repo="$TEST_DIR/migrate-v3"
+  run_git_init "$repo"
+  build_v3_db "$repo"
+
+  output=$(cd "$repo" && "$CXQ" migrate)
+  assert_contains "$output" "Migrated schema v3 -> v4"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
+    fail "migrate must bump schema_version to 4"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'due_date';")" = "1" ] ||
+    fail "migrate must add the due_date column"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT title FROM tasks WHERE id = 1;")" = "Legacy task" ] ||
+    fail "migrate must preserve existing tasks"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = 1;")" = "1" ] ||
+    fail "migrate must preserve events"
+  output=$(cd "$repo" && "$CXQ" list)
+  assert_contains "$output" "Legacy task"
+  output=$(cd "$repo" && "$CXQ" edit 1 --due 2026-12-01)
+  assert_contains "$output" "due_date: (empty) -> 2026-12-01"
+
+  # Idempotent: a second migrate is a no-op report, not an error.
+  output=$(cd "$repo" && "$CXQ" migrate)
+  assert_contains "$output" "Migrated schema v4 -> v4"
+
+  # Auto-migrate on open: a fresh v3 DB migrates when any command touches it.
+  repo="$TEST_DIR/migrate-auto"
+  run_git_init "$repo"
+  build_v3_db "$repo"
+  output=$(cd "$repo" && "$CXQ" list 2>/dev/null)
+  assert_contains "$output" "Legacy task"
+  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
+    fail "opening a v3 queue must auto-migrate it to v4"
+  pass "schema v3 -> v4 migration preserves data and auto-migrates on open"
+}
+
+free_port() {
+  python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+}
+
+test_server_smoke_and_remote_mode() {
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required for the server test"
+  command -v curl >/dev/null 2>&1 || fail "curl is required for the remote test"
+  local port db="$TEST_DIR/server.db" pid output status
+  port=$(free_port)
+  rm -f "$db" "$db-wal" "$db-shm"
+
+  CXQ_TOKEN="test-token-xyz" python3 "$ROOT/server/cxq_server.py" --port "$port" --db "$db" >"$TEST_DIR/server.log" 2>&1 &
+  pid=$!
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  output=$(curl -s "http://127.0.0.1:$port/api/v1/health")
+  assert_contains "$output" '"schema_version": 4'
+  assert_contains "$output" '"version": "0.4.0-dev"'
+
+  # Unauthenticated API access is rejected.
+  set +e
+  output=$(curl -s -w " %{http_code}" "http://127.0.0.1:$port/api/v1/tasks"); status=$?
+  set -e
+  assert_contains "$output" "401"
+
+  # Create / patch / claim over HTTP.
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" -H "Content-Type: application/json" \
+    -d '{"title":"Server task","priority":80,"tags":["alpha"],"due_date":"2000-01-01"}' \
+    "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" '"title": "Server task"'
+  assert_contains "$output" '"overdue": true'
+
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" -H "Content-Type: application/json" \
+    -X PATCH -d '{"title":"Server task edited","priority":90}' \
+    "http://127.0.0.1:$port/api/v1/tasks/1")
+  assert_contains "$output" "title: Server task -> Server task edited"
+
+  set +e
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" -H "Content-Type: application/json" \
+    -X PATCH -d '{"due_date":"2026-02-30"}' "http://127.0.0.1:$port/api/v1/tasks/1"); status=$?
+  set -e
+  assert_contains "$output" "due date must be a valid YYYY-MM-DD date"
+
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" -H "Content-Type: application/json" \
+    -X POST -d '{"agent":"codex","lease":"2h"}' "http://127.0.0.1:$port/api/v1/tasks/1/claim")
+  assert_contains "$output" '"status": "claimed"'
+
+  # Dashboard HTML is served and contains the kanban shell.
+  output=$(curl -s "http://127.0.0.1:$port/")
+  assert_contains "$output" "cxq board"
+  assert_contains "$output" "polling every 5s"
+  assert_contains "$output" "Dark / light"
+
+  # Remote-mode CLI round-trip against the same server.
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" remote status)
+  assert_contains "$output" "reachable: yes"
+  assert_contains "$output" "schema_version"
+
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" add "Remote CLI task" --priority 60 --tag remote)
+  assert_contains "$output" "Created task #2"
+
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" edit 2 --title "Remote CLI task edited" --tags-add done)
+  assert_contains "$output" "title: Remote CLI task -> Remote CLI task edited"
+  assert_contains "$output" "tags: remote -> remote,done"
+
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" list)
+  assert_contains "$output" "Remote CLI task edited"
+  assert_contains "$output" "Server task edited"
+
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" board)
+  assert_contains "$output" "## claimed (1)"
+  assert_contains "$output" "## ready (1)"
+
+  # Remote mode without a token fails clearly instead of hanging.
+  set +e
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" "$CXQ" list 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "remote mode without a token must fail"
+  assert_contains "$output" "CXQ_REMOTE_TOKEN is required"
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "server smoke test and remote-mode CLI round-trip work"
+}
+
+test_serve_requires_token_and_starts() {
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required for the serve test"
+  local repo output status pid port
+  port=$(free_port)
+  repo="$TEST_DIR/serve"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  # Without a token, serve refuses loudly.
+  set +e
+  output=$(cd "$repo" && "$CXQ" serve --port "$port" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "serve without CXQ_TOKEN must fail"
+  assert_contains "$output" "CXQ_TOKEN is required"
+
+  # With --generate-token it starts and answers health.
+  (cd "$repo" && exec "$CXQ" serve --port "$port" --generate-token >"$TEST_DIR/serve.log" 2>&1 & echo $! >"$TEST_DIR/serve.pid")
+  pid=$(cat "$TEST_DIR/serve.pid")
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  output=$(curl -s "http://127.0.0.1:$port/api/v1/health")
+  assert_contains "$output" '"status": "ok"'
+  assert_contains "$(cat "$TEST_DIR/serve.log")" "Generated CXQ_TOKEN"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "serve requires a token and starts with --generate-token"
+}
+
+test_doctor_reports_remote_mode() {
+  local repo output
+  repo="$TEST_DIR/doctor-remote"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  output=$(cd "$repo" && CXQ_REMOTE_URL="http://127.0.0.1:18791" "$CXQ" doctor)
+  assert_contains "$output" "remote_mode: yes"
+  assert_contains "$output" "remote_url: http://127.0.0.1:18791"
+  assert_contains "$output" "repo_schema_version: 4 (expected 4)"
+  output=$(cd "$repo" && "$CXQ" doctor)
+  assert_contains "$output" "remote_mode: no"
+  pass "doctor reports schema v4 and remote mode"
+}
+
 test_installer_and_version
 test_installer_defaults_to_home_local
 test_installer_explicit_prefix_and_old_binary_warning
@@ -1646,5 +2112,15 @@ test_findings_lifecycle
 test_operational_views
 test_done_warns_about_unfinished_work
 test_concurrent_commands_do_not_lock
+test_doctor_reports_remote_mode
+test_serve_requires_token_and_starts
+test_server_smoke_and_remote_mode
+test_schema_migration_v3_to_v4
+test_export_and_watch
+test_list_filters_and_formats
+test_board_stats_activity
+test_delete_guardrails
+test_edit_rejects_bad_input
+test_edit_updates_fields_and_logs_diff
 
 printf '\n%s tests passed\n' "$PASS"

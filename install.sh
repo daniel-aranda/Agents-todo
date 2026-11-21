@@ -340,9 +340,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$(uname -s)" != "Darwin" ]; then
-  die "cxq currently supports macOS only."
-fi
+case "$(uname -s)" in
+  Darwin|Linux) ;;
+  *) die "cxq supports macOS and Linux only." ;;
+esac
 
 command -v sqlite3 >/dev/null 2>&1 || die "sqlite3 is required but was not found."
 
@@ -368,6 +369,14 @@ tmp_target="$target.tmp.$$"
 cp "$source_cli" "$tmp_target"
 chmod 0755 "$tmp_target"
 mv "$tmp_target" "$target"
+
+server_src="$script_dir/server/cxq_server.py"
+if [ -f "$server_src" ]; then
+  mkdir -p "$prefix/lib/cxq"
+  cp "$server_src" "$prefix/lib/cxq/cxq_server.py"
+  chmod 0644 "$prefix/lib/cxq/cxq_server.py"
+  printf 'Installed cxq server to %s\n' "$prefix/lib/cxq/cxq_server.py"
+fi
 
 record_install_metadata "$script_dir" "$target"
 

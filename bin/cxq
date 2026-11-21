@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CXQ_VERSION="0.3.0"
-CXQ_REPO_SCHEMA_VERSION="3"
+CXQ_VERSION="0.4.0-dev"
+CXQ_REPO_SCHEMA_VERSION="4"
 CXQ_DEFAULT_REMOTE_URL="https://github.com/daniel-aranda/Agents-todo.git"
 CXQ_SQLITE_BUSY_TIMEOUT_MS="${CXQ_SQLITE_BUSY_TIMEOUT_MS:-5000}"
 CXQ_SQLITE_MAX_ATTEMPTS="${CXQ_SQLITE_MAX_ATTEMPTS:-5}"
@@ -51,6 +51,17 @@ Usage:
   cxq repo <id>
   cxq stale
   cxq release <id>
+  cxq edit <id> [--title ...] [--priority ...] [--due YYYY-MM-DD] [--status ...]
+  cxq delete <id> [--force] | cxq remove <id> [--force]
+  cxq board
+  cxq stats
+  cxq activity [--limit N]
+  cxq export-md
+  cxq export [--format json|csv]
+  cxq watch [--interval 5s]
+  cxq migrate
+  cxq serve [--port 8080] [--host 127.0.0.1] [--db PATH] [--generate-token]
+  cxq remote status
 
 Add options:
   --priority <n>        Priority, default 50
@@ -60,6 +71,7 @@ Add options:
   --tag <tag>          Add a tag. Can be repeated.
   --acceptance <text>  Acceptance criteria
   --verify <command>   Verification command
+  --due <date>         Due date (YYYY-MM-DD)
 
 Examples:
   cxq install
@@ -99,9 +111,14 @@ cmd_version() {
 }
 
 require_macos() {
-  if [ "$(uname -s)" != "Darwin" ]; then
-    die "cxq currently supports macOS only."
-  fi
+  require_supported_platform
+}
+
+require_supported_platform() {
+  case "$(uname -s)" in
+    Darwin|Linux) ;;
+    *) die "cxq supports macOS and Linux only." ;;
+  esac
 }
 
 require_sqlite3() {
@@ -198,6 +215,7 @@ db_path_or_die() {
   root=$(project_root_or_die)
   db="$root/.codex/tasks.db"
   [ -f "$db" ] || die "cxq is not installed in this project. Run 'cxq install' at the Git root."
+  migrate_db_if_needed "$db"
   printf '%s' "$db"
 }
 
@@ -225,6 +243,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 
   priority INTEGER NOT NULL DEFAULT 50,
 
+  due_date TEXT,
+
   repo_path TEXT NOT NULL,
   branch TEXT,
 
@@ -251,6 +271,9 @@ ON tasks(status, priority DESC, created_at ASC);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_repo_status
 ON tasks(repo_path, status);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_due
+ON tasks(due_date);
 
 CREATE TABLE IF NOT EXISTS task_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -304,12 +327,12 @@ CREATE TABLE IF NOT EXISTS cxq_meta (
 );
 
 INSERT OR IGNORE INTO cxq_meta (key, value)
-VALUES ('schema_version', '3');
+VALUES ('schema_version', '4');
 
 UPDATE cxq_meta
-SET value = '3'
+SET value = '4'
 WHERE key = 'schema_version'
-  AND CAST(value AS INTEGER) < 3;
+  AND CAST(value AS INTEGER) < 4;
 
 CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
 AFTER UPDATE ON tasks
@@ -857,8 +880,8 @@ repo_update_reason() {
     if ! [[ "$version" =~ ^[0-9]+$ ]]; then
       version=0
     fi
-    if [ "$version" -lt "$CXQ_REPO_SCHEMA_VERSION" ]; then
-      reasons="${reasons}${reasons:+; }repo schema version $version is lower than $CXQ_REPO_SCHEMA_VERSION"
+    if [ "$version" -lt 3 ]; then
+      reasons="${reasons}${reasons:+; }repo schema version $version is lower than 3 (too old to auto-migrate)"
     fi
   fi
 
@@ -895,9 +918,14 @@ current_branch() {
 cmd_add() {
   require_sqlite3
 
-  local title="" body="" priority=50 status="ready" files="" tags="" acceptance="" verify=""
+  local title="" body="" priority=50 status="ready" files="" tags="" acceptance="" verify="" due=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --due)
+        [ "$#" -ge 2 ] || die "--due requires a value."
+        due=$2
+        shift 2
+        ;;
       --priority)
         [ "$#" -ge 2 ] || die "--priority requires a value."
         priority=$2
@@ -954,16 +982,21 @@ cmd_add() {
   [ -n "$title" ] || die "task title is required."
   [[ "$priority" =~ ^[0-9]+$ ]] || die "priority must be an integer."
   status_is_valid "$status" || die "invalid status: $status"
+  if [ -n "$due" ]; then
+    valid_due_date "$due" || die "due date must be a valid YYYY-MM-DD date."
+  fi
 
-  local root db branch files_json tags_json id actor
+  local root db branch files_json tags_json id actor due_sql
   root=$(project_root_or_die)
   db=$(db_path_or_die)
   branch=$(current_branch "$root")
   files_json=$(csv_to_json_array "$files")
   tags_json=$(csv_to_json_array "$tags")
   actor=$(current_actor)
+  due_sql="NULL"
+  [ -n "$due" ] && due_sql=$(sql_quote "$due")
 
-  id=$(sqlite_value "$db" "INSERT INTO tasks (title, body, status, priority, repo_path, branch, allowed_paths_json, tags_json, acceptance, verify_command) VALUES ($(sql_quote "$title"), $(sql_quote "$body"), $(sql_quote "$status"), $priority, $(sql_quote "$root"), $(sql_quote "$branch"), $(sql_quote "$files_json"), $(sql_quote "$tags_json"), $(sql_quote "$acceptance"), $(sql_quote "$verify")); SELECT last_insert_rowid();")
+  id=$(sqlite_value "$db" "INSERT INTO tasks (title, body, status, priority, due_date, repo_path, branch, allowed_paths_json, tags_json, acceptance, verify_command) VALUES ($(sql_quote "$title"), $(sql_quote "$body"), $(sql_quote "$status"), $priority, $due_sql, $(sql_quote "$root"), $(sql_quote "$branch"), $(sql_quote "$files_json"), $(sql_quote "$tags_json"), $(sql_quote "$acceptance"), $(sql_quote "$verify")); SELECT last_insert_rowid();")
   log_event "$db" "$id" "created" "$actor" "$title"
   printf 'Created task #%s\n' "$id"
 }
@@ -1029,11 +1062,28 @@ render_task_core() {
   claimed_at=$(sqlite_value "$db" "SELECT COALESCE(claimed_at, '') FROM tasks WHERE id = $id;")
   lease_until=$(sqlite_value "$db" "SELECT COALESCE(lease_until, '') FROM tasks WHERE id = $id;")
   result_summary=$(sqlite_value "$db" "SELECT result_summary FROM tasks WHERE id = $id;")
+  due_date=$(sqlite_value "$db" "SELECT COALESCE(due_date, '') FROM tasks WHERE id = $id;")
+  created_at=$(sqlite_value "$db" "SELECT created_at FROM tasks WHERE id = $id;")
+  age_days=$(sqlite_value "$db" "SELECT CAST(MAX(0, julianday('now') - julianday(created_at)) AS INTEGER) FROM tasks WHERE id = $id;")
+  lease_remaining=$(sqlite_value "$db" "SELECT CASE WHEN lease_until IS NULL OR lease_until = '' THEN '' WHEN lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now') THEN 'expired' ELSE CAST((julianday(lease_until) - julianday('now')) * 1440 AS INTEGER) || ' minutes' END FROM tasks WHERE id = $id;")
 
   printf '# Task #%s\n\n' "$id"
   printf '## Title\n%s\n\n' "$title"
   printf '## Status\n%s\n\n' "$status"
   printf '## Priority\n%s\n\n' "$priority"
+
+  printf '## Due date\n'
+  if [ -n "$due_date" ]; then
+    if [ "$due_date" "<" "$(date -u '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')" ] && [ "$status" != "done" ] && [ "$status" != "wontfix" ]; then
+      printf '%s (OVERDUE)\n\n' "$due_date"
+    else
+      printf '%s\n\n' "$due_date"
+    fi
+  else
+    printf 'None\n\n'
+  fi
+
+  printf '## Age\n%s day(s) (created %s)\n\n' "${age_days:-0}" "$created_at"
 
   printf '## Body\n'
   if [ -n "$body" ]; then
@@ -1074,6 +1124,7 @@ render_task_core() {
     [ -n "$claimed_by" ] && printf 'Claimed by: %s\n' "$claimed_by"
     [ -n "$claimed_at" ] && printf 'Claimed at: %s\n' "$claimed_at"
     [ -n "$lease_until" ] && printf 'Lease until: %s\n' "$lease_until"
+    [ -n "$lease_remaining" ] && printf 'Lease remaining: %s\n' "$lease_remaining"
     printf '\n'
   fi
 
@@ -1125,6 +1176,7 @@ render_task_show() {
   local id=$2
   render_task_core "$db" "$id"
   render_task_events "$db" "$id"
+  render_task_edit_history "$db" "$id"
 }
 
 render_task_prompt() {
@@ -1184,7 +1236,7 @@ cmd_list_needs_action() {
 cmd_list() {
   require_sqlite3
 
-  local include_all=0 status="" view=""
+  local include_all=0 status="" view="" tag="" agent="" pmin="" search="" overdue=0 due_before="" format="table"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --all)
@@ -1200,6 +1252,46 @@ cmd_list() {
         [ "$#" -ge 2 ] || die "--status requires a value."
         status=$2
         status_is_valid "$status" || die "invalid status: $status"
+        shift 2
+        ;;
+      --tag)
+        [ "$#" -ge 2 ] || die "--tag requires a value."
+        tag=$2
+        shift 2
+        ;;
+      --agent)
+        [ "$#" -ge 2 ] || die "--agent requires a value."
+        agent=$2
+        shift 2
+        ;;
+      --priority-min)
+        [ "$#" -ge 2 ] || die "--priority-min requires a value."
+        pmin=$2
+        [[ "$pmin" =~ ^[0-9]+$ ]] || die "--priority-min must be an integer."
+        shift 2
+        ;;
+      --search)
+        [ "$#" -ge 2 ] || die "--search requires a value."
+        search=$2
+        shift 2
+        ;;
+      --overdue)
+        overdue=1
+        shift
+        ;;
+      --due-before)
+        [ "$#" -ge 2 ] || die "--due-before requires a value."
+        due_before=$2
+        valid_due_date "$due_before" || die "--due-before must be a valid YYYY-MM-DD date."
+        shift 2
+        ;;
+      --format)
+        [ "$#" -ge 2 ] || die "--format requires a value."
+        format=$2
+        case "$format" in
+          json|table|md) ;;
+          *) die "invalid format: $format" ;;
+        esac
         shift 2
         ;;
       --help|-h)
@@ -1226,6 +1318,14 @@ cmd_list() {
       ;;
   esac
 
+  local filtered=0
+  [ -n "$tag" ] && filtered=1
+  [ -n "$agent" ] && filtered=1
+  [ -n "$pmin" ] && filtered=1
+  [ -n "$search" ] && filtered=1
+  [ "$overdue" -eq 1 ] && filtered=1
+  [ -n "$due_before" ] && filtered=1
+
   if [ -n "$status" ]; then
     where="status = $(sql_quote "$status")"
   elif [ "$include_all" -eq 1 ]; then
@@ -1233,7 +1333,31 @@ cmd_list() {
   else
     where="status NOT IN ('done', 'wontfix')"
   fi
+  [ -n "$tag" ] && where="$where AND EXISTS (SELECT 1 FROM json_each(tags_json) WHERE value = $(sql_quote "$tag"))"
+  [ -n "$agent" ] && where="$where AND claimed_by = $(sql_quote "$agent")"
+  [ -n "$pmin" ] && where="$where AND priority >= $pmin"
+  if [ -n "$search" ]; then
+    local esc
+    esc=$(like_escape "$search")
+    where="$where AND (title LIKE $(sql_quote "%$esc%") ESCAPE '\\' OR body LIKE $(sql_quote "%$esc%") ESCAPE '\\' OR tags_json LIKE $(sql_quote "%$esc%") ESCAPE '\\')"
+  fi
+  [ "$overdue" -eq 1 ] && where="$where AND due_date IS NOT NULL AND due_date < date('now') AND status NOT IN ('done', 'wontfix')"
+  [ -n "$due_before" ] && where="$where AND due_date IS NOT NULL AND due_date < $(sql_quote "$due_before")"
 
+  if [ "$format" = "json" ]; then
+    sqlite_run "$db" "SELECT id, status, priority, title, claimed_by, lease_until, due_date, created_at FROM tasks WHERE $where ORDER BY $(list_status_order_sql), priority DESC, created_at ASC;" -json
+    return
+  fi
+  if [ "$format" = "md" ]; then
+    printf '| id | status | priority | title |\n| --- | --- | --- | --- |\n'
+    sqlite_query "$db" "SELECT '| ' || id || ' | ' || status || ' | ' || priority || ' | ' || replace(title, '|', '/') || ' |' FROM tasks WHERE $where ORDER BY $(list_status_order_sql), priority DESC, created_at ASC;"
+    return
+  fi
+  if [ "$filtered" -eq 1 ]; then
+    sqlite_table "$db" "SELECT id, status, priority, title, COALESCE(claimed_by, '') AS claimed_by, COALESCE(lease_until, '') AS lease_until, COALESCE(due_date, '') AS due_date FROM tasks WHERE $where ORDER BY $(list_status_order_sql), priority DESC, created_at ASC;"
+    return
+  fi
+  # No new flags: byte-stable legacy output.
   sqlite_table "$db" "SELECT id, status, priority, title, COALESCE(claimed_by, '') AS claimed_by, COALESCE(lease_until, '') AS lease_until FROM tasks WHERE $where ORDER BY $(list_status_order_sql), priority DESC, created_at ASC;"
 }
 
@@ -2159,6 +2283,1168 @@ cmd_task_release() {
   printf 'Released task #%s\n' "$id"
 }
 
+# --- cxq 0.4.0 additions (inserted before cmd_version_set) ---
+
+valid_due_date() {
+  local d=${1-}
+  [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  local normalized=""
+  if date -d "$d" '+%Y-%m-%d' >/dev/null 2>&1; then
+    normalized=$(date -d "$d" '+%Y-%m-%d' 2>/dev/null || true)
+    [ "$normalized" = "$d" ]
+  elif date -j -f '%Y-%m-%d' "$d" '+%Y-%m-%d' >/dev/null 2>&1; then
+    normalized=$(date -j -f '%Y-%m-%d' "$d" '+%Y-%m-%d' 2>/dev/null || true)
+    [ "$normalized" = "$d" ]
+  else
+    return 1
+  fi
+}
+
+like_escape() {
+  local value=${1-}
+  value=${value//\\/\\\\}
+  value=${value//%/\\%}
+  value=${value//_/\\_}
+  printf '%s' "$value"
+}
+
+# CSV (comma-separated) values stored as a JSON array in a task column.
+task_json_csv() {
+  local db=$1
+  local id=$2
+  local column=$3
+  sqlite_query "$db" "SELECT COALESCE(group_concat(value, ','), '') FROM json_each((SELECT $column FROM tasks WHERE id = $id));"
+}
+
+csv_add() {
+  local csv=${1-}
+  local val=${2-}
+  [ -n "$val" ] || { printf '%s' "$csv"; return 0; }
+  if [ -z "$csv" ]; then
+    printf '%s' "$val"
+    return 0
+  fi
+  case ",$csv," in
+    *",$val,"*) printf '%s' "$csv" ;;
+    *) printf '%s,%s' "$csv" "$val" ;;
+  esac
+}
+
+csv_remove() {
+  local csv=${1-}
+  local val=${2-}
+  local out="" part
+  local parts=()
+  if [ -n "$csv" ]; then
+    IFS=',' read -r -a parts <<<"$csv"
+    for part in "${parts[@]}"; do
+      part=$(trim "$part")
+      [ -n "$part" ] || continue
+      [ "$part" = "$val" ] && continue
+      out="${out}${out:+,}$part"
+    done
+  fi
+  printf '%s' "$out"
+}
+
+db_schema_version() {
+  local db=$1
+  local v
+  v=$(sqlite_value "$db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';" 2>/dev/null || true)
+  [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  printf '%s' "$v"
+}
+
+# Bring a queue DB up to the current schema (v4). Idempotent, preserves data.
+# Prints a one-line notice to stderr when it actually migrates.
+migrate_db() {
+  local db=$1
+  local before has_due
+  before=$(db_schema_version "$db")
+  if [ "$before" -ge "$CXQ_REPO_SCHEMA_VERSION" ]; then
+    return 0
+  fi
+  # Add the column BEFORE applying the v4 schema: schema_sql creates an
+  # index on due_date, which fails on a v3 table that lacks the column.
+  has_due=$(sqlite_value "$db" "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'due_date';" 2>/dev/null || printf '0')
+  if [ "$has_due" = "0" ]; then
+    sqlite_exec "$db" "ALTER TABLE tasks ADD COLUMN due_date TEXT;"
+  fi
+  sqlite_run "$db" "$(schema_sql)" >/dev/null
+  sqlite_exec "$db" "CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_date); INSERT OR REPLACE INTO cxq_meta (key, value) VALUES ('schema_version', '$CXQ_REPO_SCHEMA_VERSION');"
+  printf 'cxq: migrated queue schema v%s -> v%s\n' "$before" "$CXQ_REPO_SCHEMA_VERSION" >&2
+}
+
+# Auto-migrate on open (skipped for `cxq migrate`, which reports itself).
+migrate_db_if_needed() {
+  local db=$1
+  [ "${CXQ_SKIP_AUTO_MIGRATE:-}" = "1" ] && return 0
+  migrate_db "$db"
+}
+
+cmd_migrate() {
+  require_sqlite3
+  [ "$#" -eq 0 ] || die "migrate does not accept arguments."
+  local root db before after schema_file new_schema
+  root=$(project_root_or_die)
+  db=$(db_path_or_die)
+  before=$(db_schema_version "$db")
+  migrate_db "$db"
+  after=$(db_schema_version "$db")
+  schema_file="$root/.codex/tasks.schema.sql"
+  new_schema=$(schema_sql)
+  if [ ! -f "$schema_file" ]; then
+    printf '%s' "$new_schema" >"$schema_file"
+    printf 'Created: .codex/tasks.schema.sql (schema v%s)\n' "$after"
+  elif grep -q "schema_version', '1'" "$schema_file" || grep -q "schema_version', '3'" "$schema_file"; then
+    # Old stock template (v1 file shipped with the repo, or a v3-era file):
+    # not a user customization, safe to refresh in place.
+    printf '%s' "$new_schema" >"$schema_file"
+    printf 'Updated: .codex/tasks.schema.sql to schema v%s\n' "$after"
+  elif ! cmp -s <(printf '%s' "$new_schema") "$schema_file"; then
+    printf '%s' "$new_schema" >"$schema_file.new"
+    printf 'Left customized schema file unchanged; new template written to .codex/tasks.schema.sql.new\n'
+  fi
+  printf 'Migrated schema v%s -> v%s\n' "$before" "$after"
+  printf 'Database: %s\n' "$db"
+}
+
+render_task_edit_history() {
+  local db=$1
+  local id=$2
+  local edits
+  edits=$(sqlite_query "$db" "SELECT '- ' || created_at || ' by ' || actor || ': ' || replace(note, char(10), ' ') FROM task_events WHERE task_id = $id AND event_type = 'edited' ORDER BY created_at DESC, id DESC LIMIT 20;")
+  printf '## Edit history\n'
+  if [ -n "$edits" ]; then
+    printf '%s\n' "$edits"
+  else
+    printf 'None\n'
+  fi
+  printf '\n'
+}
+
+cmd_edit() {
+  require_sqlite3
+  [ "$#" -ge 1 ] || die "usage: cxq edit <id> [--title ...] [--status ...] [...]"
+
+  local id=$1
+  require_task_id "$id"
+  shift
+
+  local new_title="" new_body="" new_priority="" new_status="" new_acceptance=""
+  local new_verify="" new_branch="" new_due="" new_due_set=0 reason=""
+  local files_set="" files_add="" files_remove="" tags_set="" tags_add="" tags_remove=""
+  local have_flag=0
+  local _cxq_parts=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --title) [ "$#" -ge 2 ] || die "--title requires a value."; new_title=$2; have_flag=1; shift 2 ;;
+      --body) [ "$#" -ge 2 ] || die "--body requires a value."; new_body=$2; have_flag=1; shift 2 ;;
+      --priority) [ "$#" -ge 2 ] || die "--priority requires a value."; new_priority=$2; have_flag=1; shift 2 ;;
+      --status) [ "$#" -ge 2 ] || die "--status requires a value."; new_status=$2; have_flag=1; shift 2 ;;
+      --acceptance) [ "$#" -ge 2 ] || die "--acceptance requires a value."; new_acceptance=$2; have_flag=1; shift 2 ;;
+      --verify|--verify-command) [ "$#" -ge 2 ] || die "$1 requires a value."; new_verify=$2; have_flag=1; shift 2 ;;
+      --branch) [ "$#" -ge 2 ] || die "--branch requires a value."; new_branch=$2; have_flag=1; shift 2 ;;
+      --due) [ "$#" -ge 2 ] || die "--due requires a value."; new_due=$2; new_due_set=1; have_flag=1; shift 2 ;;
+      --due-clear) new_due=""; new_due_set=1; have_flag=1; shift ;;
+      --reason) [ "$#" -ge 2 ] || die "--reason requires a value."; reason=$2; shift 2 ;;
+      --files|--allowed-paths) [ "$#" -ge 2 ] || die "$1 requires a value."; files_set=$2; have_flag=1; shift 2 ;;
+      --files-add) [ "$#" -ge 2 ] || die "--files-add requires a value."; files_add=$2; have_flag=1; shift 2 ;;
+      --files-remove) [ "$#" -ge 2 ] || die "--files-remove requires a value."; files_remove=$2; have_flag=1; shift 2 ;;
+      --tags) [ "$#" -ge 2 ] || die "--tags requires a value."; tags_set=$2; have_flag=1; shift 2 ;;
+      --tags-add) [ "$#" -ge 2 ] || die "--tags-add requires a value."; tags_add=$2; have_flag=1; shift 2 ;;
+      --tags-remove) [ "$#" -ge 2 ] || die "--tags-remove requires a value."; tags_remove=$2; have_flag=1; shift 2 ;;
+      --help|-h) usage; exit 0 ;;
+      --*) die "unknown edit option: $1" ;;
+      *) die "unknown edit argument: $1" ;;
+    esac
+  done
+  [ "$have_flag" -eq 1 ] || die "cxq edit requires at least one change flag (see --help)."
+
+  if [ -n "$new_priority" ]; then
+    [[ "$new_priority" =~ ^[0-9]+$ ]] || die "priority must be an integer."
+  fi
+  if [ "$new_due_set" -eq 1 ] && [ -n "$new_due" ]; then
+    valid_due_date "$new_due" || die "due date must be a valid YYYY-MM-DD date."
+  fi
+  if [ -n "$new_status" ]; then
+    status_is_valid "$new_status" || die "invalid status: $new_status"
+  fi
+
+  local db actor
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  actor=$(current_actor)
+
+  local old_title old_body old_priority old_status old_acceptance old_verify old_branch old_due old_files old_tags
+  old_title=$(sqlite_value "$db" "SELECT title FROM tasks WHERE id = $id;")
+  old_body=$(sqlite_value "$db" "SELECT body FROM tasks WHERE id = $id;")
+  old_priority=$(sqlite_value "$db" "SELECT priority FROM tasks WHERE id = $id;")
+  old_status=$(sqlite_value "$db" "SELECT status FROM tasks WHERE id = $id;")
+  old_acceptance=$(sqlite_value "$db" "SELECT acceptance FROM tasks WHERE id = $id;")
+  old_verify=$(sqlite_value "$db" "SELECT verify_command FROM tasks WHERE id = $id;")
+  old_branch=$(sqlite_value "$db" "SELECT COALESCE(branch, '') FROM tasks WHERE id = $id;")
+  old_due=$(sqlite_value "$db" "SELECT COALESCE(due_date, '') FROM tasks WHERE id = $id;")
+  old_files=$(task_json_csv "$db" "$id" "allowed_paths_json")
+  old_tags=$(task_json_csv "$db" "$id" "tags_json")
+
+  # Resolve --files/--tags set/add/remove into final CSV values.
+  local final_files="$old_files" final_tags="$old_tags"
+  if [ -n "$files_set" ]; then final_files="$files_set"; fi
+  if [ -n "$files_add" ]; then
+    local part
+    IFS=',' read -r -a _cxq_parts <<<"$files_add"
+    for part in "${_cxq_parts[@]}"; do final_files=$(csv_add "$final_files" "$(trim "$part")"); done
+  fi
+  if [ -n "$files_remove" ]; then
+    local part
+    IFS=',' read -r -a _cxq_parts <<<"$files_remove"
+    for part in "${_cxq_parts[@]}"; do final_files=$(csv_remove "$final_files" "$(trim "$part")"); done
+  fi
+  if [ -n "$tags_set" ]; then final_tags="$tags_set"; fi
+  if [ -n "$tags_add" ]; then
+    local part
+    IFS=',' read -r -a _cxq_parts <<<"$tags_add"
+    for part in "${_cxq_parts[@]}"; do final_tags=$(csv_add "$final_tags" "$(trim "$part")"); done
+  fi
+  if [ -n "$tags_remove" ]; then
+    local part
+    IFS=',' read -r -a _cxq_parts <<<"$tags_remove"
+    for part in "${_cxq_parts[@]}"; do final_tags=$(csv_remove "$final_tags" "$(trim "$part")"); done
+  fi
+
+  if [ -n "$new_status" ] && [ "$new_status" != "$old_status" ]; then
+    if [ "$new_status" = "claimed" ]; then
+      die "use 'cxq claim <id>' to claim a task (a claim needs an agent and a lease)."
+    fi
+    transition_allows "$old_status" "$new_status" ||
+      die "cannot move task $id from $old_status to $new_status; run 'cxq status-transitions'."
+    case "$old_status" in
+      review|done)
+        [ -n "$reason" ] || die "moving a task out of $old_status requires --reason."
+        ;;
+    esac
+  fi
+
+  local sets="" diffs="" disp_old disp_new
+  add_change() {
+    local field=$1 old=$2 new=$3 sql_value=$4
+    [ "$old" != "$new" ] || return 0
+    disp_old=${old:-"(empty)"}
+    disp_new=${new:-"(empty)"}
+    diffs="${diffs}${diffs:+; }$field: $disp_old -> $disp_new"
+    sets="${sets}${sets:+, }$field = $sql_value"
+  }
+  sets=""; diffs=""
+  [ -n "$new_title" ] && add_change "title" "$old_title" "$new_title" "$(sql_quote "$new_title")"
+  [ -n "$new_body" ] || new_body="$old_body"
+  # body may legitimately be set to an empty string only via explicit flag;
+  # bash cannot distinguish here, so --body "" is treated as no change.
+  if [ "$new_body" != "$old_body" ]; then add_change "body" "$old_body" "$new_body" "$(sql_quote "$new_body")"; fi
+  [ -n "$new_priority" ] && add_change "priority" "$old_priority" "$new_priority" "$new_priority"
+  if [ -n "$new_status" ] && [ "$new_status" != "$old_status" ]; then
+    add_change "status" "$old_status" "$new_status" "$(sql_quote "$new_status")"
+    case "$new_status" in
+      ready|inbox|blocked|done)
+        sets="${sets}${sets:+, }claimed_by = NULL, claimed_at = NULL, lease_until = NULL"
+        ;;
+    esac
+    if [ -n "$reason" ]; then
+      diffs="${diffs} (reason: $reason)"
+    fi
+  fi
+  if [ "$new_acceptance" != "$old_acceptance" ] && { [ -n "$new_acceptance" ] || [ "$new_acceptance" != "$old_acceptance" ]; }; then
+    # Only record when the flag was passed; --acceptance "" is ambiguous, skip empty.
+    [ -n "$new_acceptance" ] && add_change "acceptance" "$old_acceptance" "$new_acceptance" "$(sql_quote "$new_acceptance")"
+  fi
+  [ -n "$new_verify" ] && add_change "verify_command" "$old_verify" "$new_verify" "$(sql_quote "$new_verify")"
+  [ -n "$new_branch" ] && add_change "branch" "$old_branch" "$new_branch" "$(sql_quote "$new_branch")"
+  if [ "$new_due_set" -eq 1 ]; then
+    if [ -n "$new_due" ]; then
+      add_change "due_date" "$old_due" "$new_due" "$(sql_quote "$new_due")"
+    elif [ -n "$old_due" ]; then
+      diffs="${diffs}${diffs:+; }due_date: $old_due -> (empty)"
+      sets="${sets}${sets:+, }due_date = NULL"
+    fi
+  fi
+  if [ "$final_files" != "$old_files" ]; then
+    add_change "allowed_paths" "$old_files" "$final_files" "$(sql_quote "$(csv_to_json_array "$final_files")")"
+    # add_change used the field name for the column; fix the column name.
+    sets=${sets//allowed_paths = /allowed_paths_json = }
+  fi
+  if [ "$final_tags" != "$old_tags" ]; then
+    add_change "tags" "$old_tags" "$final_tags" "$(sql_quote "$(csv_to_json_array "$final_tags")")"
+    sets=${sets//tags = /tags_json = }
+  fi
+
+  [ -n "$diffs" ] || die "cxq edit made no changes to task $id (new values match the current ones)."
+
+  sqlite_exec "$db" "UPDATE tasks SET $sets WHERE id = $id;"
+  log_event "$db" "$id" "edited" "$actor" "$diffs"
+  printf 'Edited task #%s: %s\n' "$id" "$diffs"
+}
+
+cmd_delete() {
+  require_sqlite3
+  [ "$#" -ge 1 ] || die "usage: cxq delete <id> [--force]"
+
+  local id=$1 force=0
+  require_task_id "$id"
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force|--yes) force=1; shift ;;
+      --help|-h) usage; exit 0 ;;
+      *) die "unknown delete option: $1" ;;
+    esac
+  done
+
+  local db status
+  db=$(db_path_or_die)
+  task_exists "$db" "$id" || die "task not found: $id"
+  status=$(sqlite_value "$db" "SELECT status FROM tasks WHERE id = $id;")
+  case "$status" in
+    inbox|wontfix|done) ;;
+    *)
+      [ "$force" -eq 1 ] || die "task $id is $status; only inbox, wontfix, or done tasks can be deleted without --force."
+      ;;
+  esac
+  if [ "$force" -ne 1 ]; then
+    if gate_is_interactive; then
+      local answer
+      printf 'Delete task #%s (%s)? This cannot be undone. [y/N] ' "$id" "$status" >&2
+      answer=$(gate_read_answer)
+      printf '\n' >&2
+      case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *) die "task $id was not deleted." ;;
+      esac
+    else
+      die "deleting task $id requires --force in non-interactive mode."
+    fi
+  fi
+  sqlite_exec "$db" "DELETE FROM task_events WHERE task_id = $id; DELETE FROM task_findings WHERE task_id = $id; DELETE FROM task_dependencies WHERE task_id = $id OR blocker_task_id = $id; DELETE FROM tasks WHERE id = $id;"
+  printf 'Deleted task #%s\n' "$id"
+}
+
+cmd_board() {
+  require_sqlite3
+  local db status count rows
+  db=$(db_path_or_die)
+  printf '# cxq board\n\n'
+  for status in inbox ready claimed blocked review done wontfix; do
+    count=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE status = '$status';")
+    printf '## %s (%s)\n' "$status" "$count"
+    rows=$(sqlite_query "$db" "SELECT '# ' || id || ' [P' || priority || '] ' || title || CASE WHEN due_date IS NOT NULL AND due_date < date('now') AND status NOT IN ('done', 'wontfix') THEN ' OVERDUE (due ' || due_date || ')' WHEN due_date IS NOT NULL THEN ' due ' || due_date ELSE '' END || CASE WHEN status = 'claimed' AND lease_until IS NOT NULL AND lease_until < strftime('%Y-%m-%dT%H:%M:%fZ', 'now') THEN ' LEASE EXPIRED' ELSE '' END || CASE WHEN claimed_by IS NOT NULL AND claimed_by <> '' THEN ' -- ' || claimed_by ELSE '' END FROM tasks WHERE status = '$status' ORDER BY priority DESC, created_at ASC;")
+    if [ -n "$rows" ]; then
+      printf '%s\n' "$rows"
+    else
+      printf '(empty)\n'
+    fi
+    printf '\n'
+  done
+}
+
+cmd_stats() {
+  require_sqlite3
+  local db total overdue stale oldest done7 status count
+  db=$(db_path_or_die)
+  total=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks;")
+  printf 'tasks_total: %s\n' "$total"
+  for status in inbox ready claimed blocked review done wontfix; do
+    count=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE status = '$status';")
+    printf 'status_%s: %s\n' "$status" "$count"
+  done
+  overdue=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE due_date IS NOT NULL AND due_date < date('now') AND status NOT IN ('done', 'wontfix');")
+  printf 'overdue: %s\n' "$overdue"
+  stale=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE status = 'review' AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours');")
+  printf 'stale_reviews: %s\n' "$stale"
+  oldest=$(sqlite_query "$db" "SELECT '#' || id || ' ' || title || ' (created ' || created_at || ')' FROM tasks WHERE status = 'ready' ORDER BY created_at ASC LIMIT 1;")
+  printf 'oldest_ready: %s\n' "${oldest:-none}"
+  done7=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND updated_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days');")
+  printf 'done_last_7d: %s\n' "$done7"
+  printf 'top_blockers:\n'
+  local blockers
+  blockers=$(sqlite_query "$db" "SELECT '- #' || t.id || ' ' || t.title || ' blocks ' || COUNT(*) || ' task(s)' FROM task_dependencies td JOIN tasks t ON t.id = td.blocker_task_id GROUP BY t.id ORDER BY COUNT(*) DESC, t.id ASC LIMIT 5;")
+  if [ -n "$blockers" ]; then
+    printf '%s\n' "$blockers"
+  else
+    printf 'none\n'
+  fi
+}
+
+cmd_activity() {
+  require_sqlite3
+  local limit=20
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --limit) [ "$#" -ge 2 ] || die "--limit requires a value."; limit=$2; shift 2 ;;
+      --help|-h) usage; exit 0 ;;
+      *) die "unknown activity option: $1" ;;
+    esac
+  done
+  [[ "$limit" =~ ^[0-9]+$ ]] || die "--limit must be an integer."
+  local db
+  db=$(db_path_or_die)
+  sqlite_table "$db" "SELECT created_at, task_id, event_type, actor, replace(note, char(10), ' ') AS note FROM task_events ORDER BY created_at DESC, id DESC LIMIT $limit;"
+}
+
+cmd_export_md() {
+  require_sqlite3
+  local db status count rows generated
+  db=$(db_path_or_die)
+  generated=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unknown')
+  printf '# cxq board\n\n'
+  printf 'Generated: %s\n\n' "$generated"
+  for status in inbox ready claimed blocked review done wontfix; do
+    count=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE status = '$status';")
+    printf '## %s (%s)\n\n' "$status" "$count"
+    rows=$(sqlite_query "$db" "SELECT '- #' || id || ' **' || replace(title, '*', '') || '** [P' || priority || ']' || CASE WHEN due_date IS NOT NULL THEN ' (due ' || due_date || ')' ELSE '' END || CASE WHEN claimed_by IS NOT NULL AND claimed_by <> '' THEN ' -- ' || claimed_by ELSE '' END FROM tasks WHERE status = '$status' ORDER BY priority DESC, created_at ASC;")
+    if [ -n "$rows" ]; then
+      printf '%s\n\n' "$rows"
+    else
+      printf '_(empty)_\n\n'
+    fi
+  done
+}
+
+cmd_export() {
+  require_sqlite3
+  local format="json"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --format) [ "$#" -ge 2 ] || die "--format requires a value."; format=$2; shift 2 ;;
+      --help|-h) usage; exit 0 ;;
+      *) die "unknown export option: $1" ;;
+    esac
+  done
+  case "$format" in
+    json|csv) ;;
+    *) die "export format must be json or csv." ;;
+  esac
+  local db sql
+  db=$(db_path_or_die)
+  sql="SELECT id, title, body, status, priority, due_date, branch, allowed_paths_json, tags_json, acceptance, verify_command, claimed_by, claimed_at, lease_until, result_summary, created_at, updated_at FROM tasks ORDER BY id ASC;"
+  if [ "$format" = "json" ]; then
+    sqlite_run "$db" "$sql" -json
+  else
+    sqlite_run "$db" "$sql" -header -csv
+  fi
+}
+
+cmd_watch() {
+  require_sqlite3
+  local interval="5s" seconds=5
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --interval) [ "$#" -ge 2 ] || die "--interval requires a value."; interval=$2; shift 2 ;;
+      --help|-h) usage; exit 0 ;;
+      *) die "unknown watch option: $1" ;;
+    esac
+  done
+  case "$interval" in
+    *s) seconds=${interval%s} ;;
+    *m) seconds=$(( ${interval%m} * 60 )) ;;
+    *) die "--interval must look like 5s or 1m." ;;
+  esac
+  [[ "$seconds" =~ ^[0-9]+$ ]] && [ "$seconds" -gt 0 ] || die "--interval must be a positive duration."
+  while :; do
+    if [ -t 1 ]; then
+      printf '\033[2J\033[H'
+    fi
+    printf 'cxq board -- %s (refresh every %s, Ctrl-C to stop)\n\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'now')" "$interval"
+    cmd_board
+    sleep "$seconds"
+  done
+}
+
+find_server_file() {
+  local script_dir candidate
+  script_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd -P || printf '.')
+  for candidate in \
+    "${CXQ_SERVER_PATH:-}" \
+    "$script_dir/../server/cxq_server.py" \
+    "$script_dir/../lib/cxq/cxq_server.py" \
+    "$HOME/.local/lib/cxq/cxq_server.py" \
+    "/usr/local/lib/cxq/cxq_server.py" ; do
+    [ -n "$candidate" ] || continue
+    [ -f "$candidate" ] && { printf '%s' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+cmd_serve() {
+  local port=8080 host="127.0.0.1" db="" generate_token=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --port) [ "$#" -ge 2 ] || die "--port requires a value."; port=$2; shift 2 ;;
+      --host) [ "$#" -ge 2 ] || die "--host requires a value."; host=$2; shift 2 ;;
+      --db) [ "$#" -ge 2 ] || die "--db requires a value."; db=$2; shift 2 ;;
+      --generate-token) generate_token=1; shift ;;
+      --help|-h) usage; exit 0 ;;
+      *) die "unknown serve option: $1" ;;
+    esac
+  done
+  [[ "$port" =~ ^[0-9]+$ ]] || die "--port must be an integer."
+  command -v python3 >/dev/null 2>&1 || die "python3 is required for 'cxq serve'."
+  local server
+  server=$(find_server_file) || die "cxq server not found (server/cxq_server.py). Reinstall with ./install.sh from the cxq repo."
+  if [ -z "$db" ]; then
+    if [ -n "${CXQ_DB:-}" ]; then
+      db="$CXQ_DB"
+    else
+      local root
+      root=$(git_root 2>/dev/null || true)
+      if [ -n "$root" ]; then
+        root=$(physical_path "$root")
+        db="$root/.codex/tasks.db"
+      else
+        db="$PWD/tasks.db"
+      fi
+    fi
+  fi
+  mkdir -p "$(dirname "$db")"
+  if [ -z "${CXQ_TOKEN:-}" ]; then
+    if [ "$generate_token" -eq 1 ]; then
+      CXQ_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+      export CXQ_TOKEN
+      printf 'Generated CXQ_TOKEN (shown once — save it, agents need it as CXQ_REMOTE_TOKEN):\n%s\n' "$CXQ_TOKEN" >&2
+    else
+      die "CXQ_TOKEN is required for 'cxq serve'. Set CXQ_TOKEN or rerun with --generate-token."
+    fi
+  fi
+  printf 'cxq server: http://%s:%s  db: %s\n' "$host" "$port" "$db" >&2
+  printf 'Dashboard: open the URL above, paste your CXQ_TOKEN when prompted.\n' >&2
+  exec python3 "$server" --host "$host" --port "$port" --db "$db"
+}
+
+cmd_remote() {
+  local action=${1:-status}
+  case "$action" in
+    status) shift ;;
+    ""|--help|-h) die "usage: cxq remote status" ;;
+    *) die "unknown remote action: $action" ;;
+  esac
+  [ "$#" -eq 0 ] || die "cxq remote status does not accept arguments."
+  remote_require_curl
+  local url body code
+  url="$(remote_base_url)/api/v1/health"
+  body=$(curl -sS --max-time 10 "$url" 2>&1) || die "remote is not reachable: $url ($body)"
+  printf 'remote_url: %s\n' "$(remote_base_url)"
+  printf 'reachable: yes\n'
+  printf 'health: %s\n' "$body"
+  if [ -n "${CXQ_REMOTE_TOKEN:-}" ]; then
+    local stats
+    stats=$(remote_api GET "/api/v1/stats" 2>/dev/null || true)
+    if [ -n "$stats" ]; then
+      printf 'stats: %s\n' "$stats"
+    fi
+  else
+    printf 'authenticated: no (CXQ_REMOTE_TOKEN is not set)\n'
+  fi
+}
+
+# --- Remote mode (CXQ_REMOTE_URL / CXQ_REMOTE_TOKEN) ---
+# The server is the single writer for a shared queue. Agents never point
+# sqlite3 at a shared file over NFS/SSHFS; they talk HTTP to cxq serve.
+
+remote_base_url() {
+  local u=${CXQ_REMOTE_URL:-}
+  u=${u%/}
+  printf '%s' "$u"
+}
+
+remote_require_curl() {
+  command -v curl >/dev/null 2>&1 || die "curl is required for remote mode (CXQ_REMOTE_URL is set)."
+}
+
+remote_require_python() {
+  command -v python3 >/dev/null 2>&1 || die "python3 is required for remote mode (JSON rendering)."
+}
+
+remote_require_token() {
+  [ -n "${CXQ_REMOTE_TOKEN:-}" ] || die "CXQ_REMOTE_TOKEN is required when CXQ_REMOTE_URL is set."
+}
+
+# remote_api <METHOD> <PATH> [body-file]
+# Prints the response body on stdout. Dies on transport failure or non-2xx.
+remote_api() {
+  local method=$1 path=$2 body_file=${3:-}
+  remote_require_curl
+  remote_require_token
+  local url tmp_out tmp_err code
+  url="$(remote_base_url)$path"
+  tmp_out=$(mktemp)
+  tmp_err=$(mktemp)
+  local -a curl_args=(-sS --max-time 30 -w '%{http_code}' -o "$tmp_out" -H "Authorization: Bearer $CXQ_REMOTE_TOKEN" -H "Accept: application/json")
+  if [ -n "$body_file" ]; then
+    curl_args+=(-H "Content-Type: application/json" --data-binary "@$body_file")
+  fi
+  code=$(curl "${curl_args[@]}" -X "$method" "$url" 2>"$tmp_err") || {
+    local err
+    err=$(cat "$tmp_err" 2>/dev/null || true)
+    rm -f "$tmp_out" "$tmp_err"
+    die "remote request failed: $url (${err:-curl error})"
+  }
+  case "$code" in
+    2*) cat "$tmp_out"; rm -f "$tmp_out" "$tmp_err"; return 0 ;;
+    *)
+      local msg
+      msg=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("error", ""))' "$tmp_out" 2>/dev/null || cat "$tmp_out")
+      rm -f "$tmp_out" "$tmp_err"
+      die "remote error $code from $url: ${msg:-unknown error}"
+      ;;
+  esac
+}
+
+remote_api_noauth() {
+  local path=$1
+  remote_require_curl
+  curl -sS --max-time 10 "$(remote_base_url)$path"
+}
+
+# json_body_file key value [key value ...]
+# Values starting with "json:" are parsed as raw JSON (arrays/objects/numbers).
+json_body_file() {
+  local f
+  f=$(mktemp)
+  python3 -c '
+import json, sys
+a = sys.argv[1:]
+d = {}
+for i in range(0, len(a) - 1, 2):
+    v = a[i + 1]
+    if v.startswith("json:"):
+        d[a[i]] = json.loads(v[5:])
+    else:
+        d[a[i]] = v
+print(json.dumps(d))
+' "$@" >"$f"
+  printf '%s' "$f"
+}
+
+url_quote() {
+  python3 -c 'import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+# Render a JSON response file as CLI text. Kinds: list, task, board, stats,
+# activity, deps, findings, prompt, raw.
+remote_render() {
+  local kind=$1 file=$2
+  remote_require_python
+  python3 - "$kind" "$file" <<'PYEOF'
+import json, sys
+kind, path = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    data = json.load(f)
+
+def show(v):
+    return "" if v is None else str(v)
+
+def task_lines(t):
+    print("# Task #%s" % t.get("id"))
+    print()
+    print("## Title\n%s\n" % show(t.get("title")))
+    print("## Status\n%s\n" % show(t.get("status")))
+    print("## Priority\n%s\n" % show(t.get("priority")))
+    if t.get("due_date"):
+        print("## Due date\n%s\n" % t["due_date"])
+    else:
+        print("## Due date\nNone\n")
+    print("## Body\n%s\n" % (show(t.get("body")) or "None"))
+    print("## Allowed paths")
+    for p in t.get("allowed_paths") or []:
+        print("- %s" % p)
+    if not t.get("allowed_paths"):
+        print("None")
+    print()
+    print("## Tags")
+    for p in t.get("tags") or []:
+        print("- %s" % p)
+    if not t.get("tags"):
+        print("None")
+    print()
+    if t.get("acceptance"):
+        print("## Acceptance criteria\n%s\n" % t["acceptance"])
+    if t.get("verify_command"):
+        print("## Verification command\n%s\n" % t["verify_command"])
+    if t.get("claimed_by") or t.get("lease_until"):
+        print("## Claim")
+        if t.get("claimed_by"):
+            print("Claimed by: %s" % t["claimed_by"])
+        if t.get("claimed_at"):
+            print("Claimed at: %s" % t["claimed_at"])
+        if t.get("lease_until"):
+            print("Lease until: %s" % t["lease_until"])
+        print()
+    if t.get("result_summary"):
+        print("## Result summary\n%s\n" % t["result_summary"])
+    events = t.get("events") or []
+    print("## Recent events")
+    for e in events[-10:]:
+        note = (": " + e.get("note", "")) if e.get("note") else ""
+        print("- %s `%s` by %s%s" % (e.get("created_at", ""), e.get("event_type", ""), e.get("actor", ""), note))
+    if not events:
+        print("None")
+    print()
+    print("## Edit history")
+    edits = [e for e in events if e.get("event_type") == "edited"]
+    for e in edits:
+        print("- %s by %s: %s" % (e.get("created_at", ""), e.get("actor", ""), e.get("note", "")))
+    if not edits:
+        print("None")
+    print()
+
+if kind == "list":
+    tasks = data.get("tasks", [data] if isinstance(data, dict) and "id" in data else data if isinstance(data, list) else [])
+    print("%-4s %-8s %-8s %s" % ("id", "status", "priority", "title"))
+    print("%-4s %-8s %-8s %s" % ("--", "------", "--------", "-" * 40))
+    for t in tasks:
+        print("%-4s %-8s %-8s %s" % (t.get("id"), t.get("status"), t.get("priority"), t.get("title")))
+elif kind == "list_md":
+    tasks = data.get("tasks", data if isinstance(data, list) else [])
+    print("| id | status | priority | title |")
+    print("| --- | --- | --- | --- |")
+    for t in tasks:
+        print("| %s | %s | %s | %s |" % (t.get("id"), t.get("status"), t.get("priority"), t.get("title")))
+elif kind == "task":
+    task_lines(data.get("task", data))
+elif kind == "board":
+    columns = data.get("columns", {})
+    for status in ["inbox", "ready", "claimed", "blocked", "review", "done", "wontfix"]:
+        tasks = columns.get(status, [])
+        print("## %s (%d)" % (status, len(tasks)))
+        if not tasks:
+            print("(empty)")
+        for t in tasks:
+            line = "# %s [P%s] %s" % (t.get("id"), t.get("priority"), t.get("title"))
+            if t.get("due_date"):
+                line += " due %s" % t["due_date"]
+                if t.get("overdue"):
+                    line += " OVERDUE"
+            if t.get("lease_expired"):
+                line += " LEASE EXPIRED"
+            if t.get("claimed_by"):
+                line += " -- %s" % t["claimed_by"]
+            print(line)
+        print()
+elif kind == "stats":
+    print("tasks_total: %s" % data.get("tasks_total"))
+    for status in ["inbox", "ready", "claimed", "blocked", "review", "done", "wontfix"]:
+        print("status_%s: %s" % (status, (data.get("by_status") or {}).get(status, 0)))
+    print("overdue: %s" % data.get("overdue"))
+    print("stale_reviews: %s" % data.get("stale_reviews"))
+    print("oldest_ready: %s" % (data.get("oldest_ready") or "none"))
+    print("done_last_7d: %s" % data.get("done_last_7d"))
+    print("top_blockers:")
+    for b in data.get("top_blockers") or []:
+        print("- #%s %s blocks %s task(s)" % (b.get("id"), b.get("title"), b.get("blocks")))
+    if not data.get("top_blockers"):
+        print("none")
+elif kind == "activity":
+    for e in data.get("events", []):
+        print("%s  #%s  %s  by %s  %s" % (e.get("created_at"), e.get("task_id"), e.get("event_type"), e.get("actor"), e.get("note", "")))
+elif kind == "deps":
+    print("# Dependencies")
+    print("Blocked by:")
+    for t in data.get("blocked_by", []):
+        print("- #%s [%s] %s" % (t.get("id"), t.get("status"), t.get("title")))
+    if not data.get("blocked_by"):
+        print("None")
+    print("Blocks:")
+    for t in data.get("blocks", []):
+        print("- #%s [%s] %s" % (t.get("id"), t.get("status"), t.get("title")))
+    if not data.get("blocks"):
+        print("None")
+elif kind == "findings":
+    for f in data.get("findings", []):
+        print("%s  %s/%s  %s" % (f.get("id"), f.get("severity"), f.get("status"), f.get("note")))
+elif kind == "prompt":
+    print(data.get("prompt", ""))
+else:
+    print(json.dumps(data, indent=2))
+PYEOF
+}
+
+remote_task_id_from_body() {
+  remote_require_python
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$1"
+}
+
+# Dispatch a CLI command to the remote server. $1 is the command name.
+cmd_remote_dispatch() {
+  local command=$1
+  shift
+  remote_require_curl
+  remote_require_token
+  local body_file="" resp_file
+  resp_file=$(mktemp)
+  case "$command" in
+    add)
+      local title="" priority=50 status="ready" body="" files="" tags="" acceptance="" verify="" due="" branch=""
+      local -a body_args=()
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --priority) priority=$2; shift 2 ;;
+          --status) status=$2; shift 2 ;;
+          --body) body=$2; shift 2 ;;
+          --files|--allowed-paths) files=$2; shift 2 ;;
+          --tag) tags="${tags}${tags:+,}$2"; shift 2 ;;
+          --acceptance) acceptance=$2; shift 2 ;;
+          --verify|--verify-command) verify=$2; shift 2 ;;
+          --due) due=$2; shift 2 ;;
+          --branch) branch=$2; shift 2 ;;
+          --help|-h) usage; exit 0 ;;
+          --*) die "unknown add option: $1" ;;
+          *) if [ -z "$title" ]; then title=$1; else body="${body}${body:+ }$1"; fi; shift ;;
+        esac
+      done
+      [ -n "$title" ] || die "task title is required."
+      body_args=(title "$title" priority "json:$priority" status "$status")
+      [ -n "$body" ] && body_args+=(body "$body")
+      [ -n "$files" ] && body_args+=(allowed_paths "json:$(csv_to_json_array "$files")")
+      [ -n "$tags" ] && body_args+=(tags "json:$(csv_to_json_array "$tags")")
+      [ -n "$acceptance" ] && body_args+=(acceptance "$acceptance")
+      [ -n "$verify" ] && body_args+=(verify_command "$verify")
+      [ -n "$due" ] && body_args+=(due_date "$due")
+      [ -n "$branch" ] && body_args+=(branch "$branch")
+      body_file=$(json_body_file "${body_args[@]}")
+      remote_api POST "/api/v1/tasks" "$body_file" >"$resp_file"
+      printf 'Created task #%s\n' "$(remote_task_id_from_body "$resp_file")"
+      ;;
+    list|ls)
+      local include_all=0 status="" view="" tag="" agent="" pmin="" search="" overdue=0 due_before="" format="table"
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --all) include_all=1; shift ;;
+          --needs-action|--questions) view=$1; shift ;;
+          --status) status=$2; shift 2 ;;
+          --tag) tag=$2; shift 2 ;;
+          --agent) agent=$2; shift 2 ;;
+          --priority-min) pmin=$2; shift 2 ;;
+          --search) search=$2; shift 2 ;;
+          --overdue) overdue=1; shift ;;
+          --due-before) due_before=$2; shift 2 ;;
+          --format) format=$2; shift 2 ;;
+          --help|-h) usage; exit 0 ;;
+          *) die "unknown list option: $1" ;;
+        esac
+      done
+      local query="?"
+      [ -n "$status" ] && query="${query}status=$(url_quote "$status")&"
+      [ -n "$tag" ] && query="${query}tag=$(url_quote "$tag")&"
+      [ -n "$agent" ] && query="${query}agent=$(url_quote "$agent")&"
+      [ -n "$pmin" ] && query="${query}priority_min=$pmin&"
+      [ -n "$search" ] && query="${query}search=$(url_quote "$search")&"
+      [ "$overdue" -eq 1 ] && query="${query}overdue=1&"
+      [ -n "$due_before" ] && query="${query}due_before=$(url_quote "$due_before")&"
+      [ "$include_all" -eq 1 ] && query="${query}all=1&"
+      [ -n "$view" ] && query="${query}view=${view#--}&"
+      remote_api GET "/api/v1/tasks${query}" >"$resp_file"
+      case "$format" in
+        json) cat "$resp_file"; printf '\n' ;;
+        md) remote_render list_md "$resp_file" ;;
+        table) remote_render list "$resp_file" ;;
+        *) die "invalid format: $format" ;;
+      esac
+      ;;
+    next)
+      local format="text"
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --format) format=$2; shift 2 ;;
+          --help|-h) usage; exit 0 ;;
+          *) die "unknown next option: $1" ;;
+        esac
+      done
+      remote_api GET "/api/v1/next" >"$resp_file" || die "No ready tasks."
+      case "$format" in
+        id) remote_task_id_from_body "$resp_file"; printf '\n' ;;
+        md) remote_render task "$resp_file" ;;
+        text) remote_render list "$resp_file" ;;
+        *) die "invalid format: $format" ;;
+      esac
+      ;;
+    show)
+      [ "$#" -eq 1 ] || die "usage: cxq show <id>"
+      require_task_id "$1"
+      remote_api GET "/api/v1/tasks/$1" >"$resp_file"
+      remote_render task "$resp_file"
+      ;;
+    prompt)
+      [ "$#" -eq 1 ] || die "usage: cxq prompt <id>"
+      require_task_id "$1"
+      remote_api GET "/api/v1/tasks/$1/prompt" >"$resp_file"
+      remote_render prompt "$resp_file"
+      ;;
+    claim)
+      [ "$#" -ge 1 ] || die "task id is required."
+      local id=$1 agent="codex" lease="2h"
+      require_task_id "$id"; shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --agent) agent=$2; shift 2 ;;
+          --lease) lease=$2; shift 2 ;;
+          *) die "unknown claim option: $1" ;;
+        esac
+      done
+      body_file=$(json_body_file agent "$agent" lease "$lease")
+      remote_api POST "/api/v1/tasks/$id/claim" "$body_file" >"$resp_file"
+      printf 'Claimed task #%s as %s\n' "$id" "$agent"
+      ;;
+    claim-next)
+      local agent="codex" lease="2h" format="id"
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --agent) agent=$2; shift 2 ;;
+          --lease) lease=$2; shift 2 ;;
+          --format) format=$2; shift 2 ;;
+          *) die "unknown claim-next option: $1" ;;
+        esac
+      done
+      body_file=$(json_body_file agent "$agent" lease "$lease")
+      remote_api POST "/api/v1/claim-next" "$body_file" >"$resp_file"
+      case "$format" in
+        id) remote_task_id_from_body "$resp_file"; printf '\n' ;;
+        md|prompt) remote_render task "$resp_file" ;;
+        *) die "invalid format: $format" ;;
+      esac
+      ;;
+    note)
+      [ "$#" -ge 2 ] || die "usage: cxq note <id> <note>"
+      local id=$1; require_task_id "$id"; shift
+      body_file=$(json_body_file note "$*")
+      remote_api POST "/api/v1/tasks/$id/note" "$body_file" >"$resp_file"
+      printf 'Noted task #%s\n' "$id"
+      ;;
+    review)
+      [ "$#" -ge 1 ] || die "task id is required."
+      local id=$1 summary=""; require_task_id "$id"; shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --summary) summary=$2; shift 2 ;;
+          *) summary="${summary}${summary:+ }$1"; shift ;;
+        esac
+      done
+      [ -n "$summary" ] || die "review summary is required."
+      body_file=$(json_body_file summary "$summary")
+      remote_api POST "/api/v1/tasks/$id/review" "$body_file" >"$resp_file"
+      printf 'Moved task #%s to review\n' "$id"
+      ;;
+    done)
+      [ "$#" -ge 1 ] || die "task id is required."
+      local id=$1 summary="" force=0; require_task_id "$id"; shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --summary) summary=$2; shift 2 ;;
+          --force|--yes) force=1; shift ;;
+          *) summary="${summary}${summary:+ }$1"; shift ;;
+        esac
+      done
+      body_file=$(json_body_file summary "$summary" force "json:$force")
+      remote_api POST "/api/v1/tasks/$id/done" "$body_file" >"$resp_file"
+      printf 'Marked task #%s done\n' "$id"
+      ;;
+    reopen)
+      [ "$#" -ge 1 ] || die "usage: cxq reopen <id> [--to ...] --reason <reason>"
+      local id=$1 target="ready" reason=""; require_task_id "$id"; shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --to) target=$2; shift 2 ;;
+          --reason) reason=$2; shift 2 ;;
+          *) die "unknown reopen option: $1" ;;
+        esac
+      done
+      [ -n "$reason" ] || die "reopen reason is required."
+      body_file=$(json_body_file to "$target" reason "$reason")
+      remote_api POST "/api/v1/tasks/$id/reopen" "$body_file" >"$resp_file"
+      printf 'Reopened task #%s\n' "$id"
+      ;;
+    release)
+      [ "$#" -eq 1 ] || die "usage: cxq release <id>"
+      require_task_id "$1"
+      body_file=$(json_body_file)
+      remote_api POST "/api/v1/tasks/$1/release" "$body_file" >"$resp_file"
+      printf 'Released task #%s\n' "$1"
+      ;;
+    edit)
+      [ "$#" -ge 1 ] || die "usage: cxq edit <id> [--title ...] [...]"
+      local id=$1; require_task_id "$id"; shift
+      local -a body_args=()
+      local have_flag=0
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --title) body_args+=(title "$2"); have_flag=1; shift 2 ;;
+          --body) body_args+=(body "$2"); have_flag=1; shift 2 ;;
+          --priority) body_args+=(priority "json:$2"); have_flag=1; shift 2 ;;
+          --status) body_args+=(status "$2"); have_flag=1; shift 2 ;;
+          --acceptance) body_args+=(acceptance "$2"); have_flag=1; shift 2 ;;
+          --verify|--verify-command) body_args+=(verify_command "$2"); have_flag=1; shift 2 ;;
+          --branch) body_args+=(branch "$2"); have_flag=1; shift 2 ;;
+          --due) body_args+=(due_date "$2"); have_flag=1; shift 2 ;;
+          --due-clear) body_args+=(due_date "json:null"); have_flag=1; shift ;;
+          --reason) body_args+=(reason "$2"); shift 2 ;;
+          --files|--allowed-paths) body_args+=(allowed_paths "json:$(csv_to_json_array "$2")"); have_flag=1; shift 2 ;;
+          --files-add) body_args+=(files_add "$2"); have_flag=1; shift 2 ;;
+          --files-remove) body_args+=(files_remove "$2"); have_flag=1; shift 2 ;;
+          --tags) body_args+=(tags "json:$(csv_to_json_array "$2")"); have_flag=1; shift 2 ;;
+          --tags-add) body_args+=(tags_add "$2"); have_flag=1; shift 2 ;;
+          --tags-remove) body_args+=(tags_remove "$2"); have_flag=1; shift 2 ;;
+          --help|-h) usage; exit 0 ;;
+          --*) die "unknown edit option: $1" ;;
+          *) die "unknown edit argument: $1" ;;
+        esac
+      done
+      [ "$have_flag" -eq 1 ] || die "cxq edit requires at least one change flag."
+      body_file=$(json_body_file "${body_args[@]}")
+      remote_api PATCH "/api/v1/tasks/$id" "$body_file" >"$resp_file"
+      local diff
+      diff=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("diff", ""))' "$resp_file" 2>/dev/null || true)
+      printf 'Edited task #%s: %s\n' "$id" "$diff"
+      ;;
+    delete|remove)
+      [ "$#" -ge 1 ] || die "usage: cxq delete <id> [--force]"
+      local id=$1 force=0; require_task_id "$id"; shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --force|--yes) force=1; shift ;;
+          *) die "unknown delete option: $1" ;;
+        esac
+      done
+      remote_api GET "/api/v1/tasks/$id" >"$resp_file"
+      local status
+      status=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$resp_file")
+      case "$status" in
+        inbox|wontfix|done) ;;
+        *) [ "$force" -eq 1 ] || die "task $id is $status; only inbox, wontfix, or done tasks can be deleted without --force." ;;
+      esac
+      if [ "$force" -ne 1 ]; then
+        if gate_is_interactive; then
+          local answer
+          printf 'Delete task #%s (%s)? This cannot be undone. [y/N] ' "$id" "$status" >&2
+          answer=$(gate_read_answer); printf '\n' >&2
+          case "$answer" in y|Y|yes|YES|Yes) ;; *) die "task $id was not deleted." ;; esac
+        else
+          die "deleting task $id requires --force in non-interactive mode."
+        fi
+      fi
+      remote_api DELETE "/api/v1/tasks/$id?force=1" >"$resp_file"
+      printf 'Deleted task #%s\n' "$id"
+      ;;
+    board)
+      remote_api GET "/api/v1/board" >"$resp_file"
+      remote_render board "$resp_file"
+      ;;
+    stats)
+      remote_api GET "/api/v1/stats" >"$resp_file"
+      remote_render stats "$resp_file"
+      ;;
+    activity)
+      local limit=20
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --limit) limit=$2; shift 2 ;;
+          *) die "unknown activity option: $1" ;;
+        esac
+      done
+      remote_api GET "/api/v1/activity?limit=$limit" >"$resp_file"
+      remote_render activity "$resp_file"
+      ;;
+    export)
+      local format="json"
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --format) format=$2; shift 2 ;;
+          *) die "unknown export option: $1" ;;
+        esac
+      done
+      remote_api GET "/api/v1/export?format=$format" >"$resp_file"
+      cat "$resp_file"; printf '\n'
+      ;;
+    export-md)
+      remote_api GET "/api/v1/export-md" >"$resp_file"
+      cat "$resp_file"
+      ;;
+    stale)
+      remote_api GET "/api/v1/stale" >"$resp_file"
+      remote_render list "$resp_file"
+      ;;
+    block)
+      [ "$#" -ge 1 ] || die "usage: cxq block <id> --by <blocker-id>"
+      local id=$1 blocker=""; require_task_id "$id"; shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in --by) blocker=$2; shift 2 ;; *) die "unknown block option: $1" ;; esac
+      done
+      [ -n "$blocker" ] || die "blocker task id is required."
+      body_file=$(json_body_file blocker_id "json:$blocker")
+      remote_api POST "/api/v1/tasks/$id/block" "$body_file" >"$resp_file"
+      printf 'Task #%s is blocked by #%s\n' "$id" "$blocker"
+      ;;
+    unblock)
+      [ "$#" -ge 1 ] || die "usage: cxq unblock <id> --by <blocker-id>"
+      local id=$1 blocker=""; require_task_id "$id"; shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in --by) blocker=$2; shift 2 ;; *) die "unknown unblock option: $1" ;; esac
+      done
+      [ -n "$blocker" ] || die "blocker task id is required."
+      body_file=$(json_body_file blocker_id "json:$blocker")
+      remote_api POST "/api/v1/tasks/$id/unblock" "$body_file" >"$resp_file"
+      printf 'Task #%s is no longer blocked by #%s\n' "$id" "$blocker"
+      ;;
+    deps)
+      [ "$#" -eq 1 ] || die "usage: cxq deps <id>"
+      require_task_id "$1"
+      remote_api GET "/api/v1/tasks/$1/deps" >"$resp_file"
+      remote_render deps "$resp_file"
+      ;;
+    finding)
+      local action=${1:-}; shift
+      case "$action" in
+        list)
+          [ "$#" -eq 1 ] || die "usage: cxq finding list <id>"
+          remote_api GET "/api/v1/tasks/$1/findings" >"$resp_file"
+          remote_render findings "$resp_file"
+          ;;
+        add)
+          local id=$1; require_task_id "$id"; shift
+          local severity="medium" note="" followup=""
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --severity) severity=$2; shift 2 ;;
+              --note) note=$2; shift 2 ;;
+              --followup) followup=$2; shift 2 ;;
+              *) note="${note}${note:+ }$1"; shift ;;
+            esac
+          done
+          [ -n "$note" ] || die "finding note is required."
+          local -a fargs=(severity "$severity" note "$note")
+          [ -n "$followup" ] && fargs+=(followup_task_id "json:$followup")
+          body_file=$(json_body_file "${fargs[@]}")
+          remote_api POST "/api/v1/tasks/$id/findings" "$body_file" >"$resp_file"
+          printf 'Added finding to task #%s\n' "$id"
+          ;;
+        resolve)
+          local fid=$1; require_task_id "$fid"; shift
+          local fstatus="resolved"
+          while [ "$#" -gt 0 ]; do
+            case "$1" in --status) fstatus=$2; shift 2 ;; *) die "unknown finding resolve option: $1" ;; esac
+          done
+          body_file=$(json_body_file status "$fstatus")
+          remote_api POST "/api/v1/findings/$fid/resolve" "$body_file" >"$resp_file"
+          printf 'Marked finding #%s as %s\n' "$fid" "$fstatus"
+          ;;
+        *) die "unknown finding action: $action" ;;
+      esac
+      ;;
+    *)
+      die "unknown remote command: $command"
+      ;;
+  esac
+  rm -f "$resp_file"
+  [ -n "$body_file" ] && rm -f "$body_file"
+  return 0
+}
+
 cmd_version_set() {
   [ "$#" -eq 1 ] || die "usage: cxq version set X.Y.Z"
   local new_version=$1
@@ -2589,6 +3875,12 @@ cmd_doctor() {
   printf 'install_source_dir: %s\n' "${install_source:-unknown}"
   printf 'install_bin_path: %s\n' "${install_bin:-unknown}"
   printf 'install_remote_url: %s\n' "${install_remote:-unknown}"
+  if [ -n "${CXQ_REMOTE_URL:-}" ]; then
+    printf 'remote_mode: yes\n'
+    printf 'remote_url: %s\n' "$CXQ_REMOTE_URL"
+  else
+    printf 'remote_mode: no\n'
+  fi
   printf 'update_required: %s\n' "${required:-0}"
   printf 'update_required_kind: %s\n' "${kind:-none}"
   printf 'update_required_reason: %s\n' "${reason:-none}"
@@ -2823,6 +4115,7 @@ EOF
 command_uses_update_gate() {
   case "${1:-}" in
     add|list|ls|next|show|claim|claim-next|block|deps|unblock|note|prompt|review|done|repo|stale) return 0 ;;
+    edit|delete|remove|board|stats|activity|export|export-md|watch) return 0 ;;
     reopen|followup|split|finding|review-stale) return 0 ;;
     *) return 1 ;;
   esac
@@ -2911,6 +4204,8 @@ handle_update_required_gate() {
 
 run_update_gate() {
   [ "${CXQ_NO_UPDATE_CHECK:-}" = "1" ] && return 0
+  # Remote mode has no local queue to update; the server owns the schema.
+  [ -n "${CXQ_REMOTE_URL:-}" ] && return 0
 
   init_state_db
   detect_repo_update_required
@@ -2929,8 +4224,22 @@ run_update_gate() {
 
 main() {
   local command=${1:-help}
+  if [ "$command" = "migrate" ]; then
+    export CXQ_SKIP_AUTO_MIGRATE=1
+  fi
   if command_uses_update_gate "$command"; then
     run_update_gate "$@"
+  fi
+
+  # Remote mode: the server owns the queue; route read/write commands over HTTP.
+  if [ -n "${CXQ_REMOTE_URL:-}" ]; then
+    case "$command" in
+      add|list|ls|next|show|claim|claim-next|block|deps|unblock|note|prompt|review|done|reopen|release|edit|delete|remove|board|stats|activity|export|export-md|stale|finding)
+        shift
+        cmd_remote_dispatch "$command" "$@"
+        return $?
+        ;;
+    esac
   fi
 
   case "$command" in
@@ -3028,6 +4337,53 @@ main() {
       shift
       [ "$#" -eq 0 ] || die "stale does not accept arguments."
       cmd_stale
+      ;;
+    edit)
+      shift
+      cmd_edit "$@"
+      ;;
+    delete|remove)
+      shift
+      cmd_delete "$@"
+      ;;
+    board)
+      shift
+      [ "$#" -eq 0 ] || die "board does not accept arguments."
+      cmd_board
+      ;;
+    stats)
+      shift
+      [ "$#" -eq 0 ] || die "stats does not accept arguments."
+      cmd_stats
+      ;;
+    activity)
+      shift
+      cmd_activity "$@"
+      ;;
+    export-md)
+      shift
+      [ "$#" -eq 0 ] || die "export-md does not accept arguments."
+      cmd_export_md
+      ;;
+    export)
+      shift
+      cmd_export "$@"
+      ;;
+    watch)
+      shift
+      cmd_watch "$@"
+      ;;
+    migrate)
+      shift
+      cmd_migrate "$@"
+      ;;
+    serve)
+      shift
+      cmd_serve "$@"
+      ;;
+    remote)
+      shift
+      cmd_remote "$@"
       ;;
     reopen)
       shift
