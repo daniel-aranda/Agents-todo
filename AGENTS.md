@@ -4,35 +4,42 @@ Guidance for Codex and other AI agents working on this repository.
 
 ## Project
 
-This repo contains `cxq`, a small macOS-first CLI for a repo-local SQLite task queue for Codex/local coding agents.
+This repo contains `cxq`, a small CLI for a SQLite task queue for Codex/local coding agents, on macOS and Linux.
 
 The implementation is intentionally boring:
 
-- Bash
+- Bash for the CLI
 - git
 - sqlite3
-- no Node
-- no Python
-- no server
-- no daemon
+- Python 3 standard library only, for `server/cxq_server.py` and nothing else
+  (added in 0.4.0 for the shared-queue server; no pip packages, no Node)
+- no daemon (the server runs in the foreground; Fly/systemd own its lifecycle)
 - no external runtime dependencies
 
-Keep it that way unless explicitly instructed.
+Keep it that way unless explicitly instructed. The "no server" rule was
+lifted by Daniel in 0.4.0 specifically for this stdlib-only server; do not
+use it as a reason to add frameworks, ORMs, or other runtimes.
 
 ## Files
 
 Important files:
 
 - `bin/cxq`: main CLI implementation.
-- `install.sh`: installs the local `cxq` command.
-- `tests/run_tests.sh`: shell test suite.
+- `server/cxq_server.py`: shared-queue HTTP server (Python stdlib only).
+- `deploy/`: Dockerfile, `fly.toml`, and deployment docs for the server.
+- `install.sh`: installs the local `cxq` command (and the server file).
+- `tests/run_tests.sh`: shell test suite (includes server smoke + remote-mode tests).
 - `Makefile`: test entrypoint.
 - `README.md`: public docs.
 
 ## Coding rules
 
-- Keep Bash portable for macOS.
+- Keep Bash portable for macOS and Linux.
 - Do not use GNU-only flags unless macOS supports them by default.
+- Keep the server Python-stdlib-only: `http.server` + `sqlite3`, no imports
+  outside the standard library, no pip packages.
+- Remote mode (`CXQ_REMOTE_URL`) must go through the HTTP API; never point
+  sqlite3 at a shared file over NFS/SSHFS. The server is the single writer.
 - Do not depend on `sort -V`.
 - Quote variables.
 - Validate task ids as integers before using them in SQL.

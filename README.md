@@ -1,10 +1,16 @@
 # cxq
 
-`cxq` is a tiny local work queue for Codex-style coding agents.
+`cxq` is a tiny work queue for Codex-style coding agents.
 
-It is not a project manager, kanban board, or issue tracker. It is a repo-local
-SQLite queue with a small command-line interface, designed so humans and agents
+It is not a project manager, kanban board, or issue tracker. It is a SQLite
+queue with a small command-line interface, designed so humans and agents
 can coordinate implementation work without editing ad hoc TODO files.
+
+By default the queue is repo-local (`.codex/tasks.db`). Since v0.4.0 it can
+also run **shared**: one small server owns the SQLite file and every agent
+VM talks to it over HTTPS (`cxq serve` + `CXQ_REMOTE_URL`), so all agents
+see the same board. The CLI, the dashboard, and the API all edit the same
+tasks, with the same validation and the same event history.
 
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/174b46e1-0048-4f17-8514-e53256d0b6bd" />
 
@@ -17,7 +23,7 @@ cd Agents-todo
 ./install.sh
 ~~~
 
-That installs a global `cxq` command on macOS. Then, inside any Git project:
+That installs a global `cxq` command on macOS or Linux. Then, inside any Git project:
 
 ~~~sh
 cxq -v
@@ -54,12 +60,14 @@ cxq claim-next --agent codex --lease 2h --format prompt
 
 ## Requirements
 
-- macOS
+- macOS or Linux
 - `bash`
 - `git`
 - `sqlite3`
 
-No package manager, Node.js, or Python runtime is required.
+No package manager or Node.js runtime is required. `python3` and `curl` are
+only needed for the optional shared server (`cxq serve`) and remote mode
+(`CXQ_REMOTE_URL`); the local queue still needs nothing but `bash` + `sqlite3`.
 
 ## Why cxq exists
 
@@ -90,7 +98,7 @@ Git         = project boundary
 
 ## Current platform
 
-`cxq` is macOS-only for now.
+`cxq` runs on macOS and Linux (agents' cloud VMs are Linux).
 
 The project is designed for people who clone this repository, run
 `install.sh`, and then use the installed `cxq` command from other local Git
@@ -201,6 +209,17 @@ cxq done 42
 cxq repo 42
 cxq stale
 cxq release 42
+cxq edit 42 --title "New title" --priority 90 --due 2026-12-01
+cxq delete 42 --force
+cxq board
+cxq stats
+cxq activity --limit 20
+cxq export-md
+cxq export --format json
+cxq watch --interval 5s
+cxq migrate
+cxq serve --port 8080 --generate-token
+cxq remote status
 ~~~
 
 `cxq doctor` is read-only. It reports the installed version, PATH resolution,
@@ -246,6 +265,127 @@ cxq claim-next --agent codex --lease 2h --format prompt
 `cxq prompt 42` renders a deterministic agent prompt with the task body, tags,
 allowed paths, acceptance criteria, verification command, recent events, result
 summary when present, and finishing instructions.
+
+## Editing tasks
+
+Tickets are editable — this was the biggest gap before v0.4.0:
+
+~~~sh
+cxq edit 42 --title "Refactor billing webhook verifier" --priority 80
+cxq edit 42 --due 2026-12-01 --tags-add security --files-add "src/billing"
+cxq edit 42 --acceptance "add tests for bad signatures" --verify "pnpm test billing"
+cxq edit 42 --status ready --reason "acceptance criteria 3 is still missing"
+cxq edit 42 --due-clear
+~~~
+
+Flags: `--title`, `--body`, `--priority`, `--acceptance`, `--verify`,
+`--branch`, `--due YYYY-MM-DD` (validated as a real calendar date),
+`--due-clear`, `--status`, `--files` (set) / `--files-add` / `--files-remove`,
+`--tags` (set) / `--tags-add` / `--tags-remove`, and `--reason`.
+At least one change flag is required; an edit that changes nothing is an
+error. Every edit logs **one** `edited` event with a human-readable diff
+(`title: old -> new; priority: 50 -> 90`), and `cxq show 42` renders the
+due date, age, lease remaining, and the full edit history.
+
+`--status` is validated against the status-transitions table, so
+`ready -> done` is still rejected; moving a task out of `review` or `done`
+requires `--reason`. Use `cxq claim` to claim a task — `edit --status claimed`
+is rejected because a claim needs an agent and a lease.
+
+Deleting is deliberately guarded:
+
+~~~sh
+cxq delete 42 --force   # alias: cxq remove 42 --force
+~~~
+
+Only `inbox`, `wontfix`, and `done` tasks can be deleted without `--force`.
+Without `--force`, a TTY asks for confirmation and a non-interactive run
+refuses. Delete cascades to the task's events, findings, and dependencies.
+
+## Board, stats, and activity
+
+~~~sh
+cxq board                 # kanban grouped by status, with counts, OVERDUE and LEASE EXPIRED flags
+cxq stats                 # counts by status, overdue, stale reviews, oldest ready, done last 7d, top blockers
+cxq activity              # recent events across all tasks, newest first
+cxq activity --limit 50
+cxq export-md             # Markdown mirror of the board (stdout)
+cxq export --format json  # full task export (stdout)
+cxq export --format csv
+cxq watch                 # re-render the board every 5s until Ctrl-C
+cxq watch --interval 10s
+~~~
+
+`cxq list` also grew filters that compose:
+
+~~~sh
+cxq list --status review --tag security --agent codex
+cxq list --priority-min 80 --search "auth refresh" --overdue --due-before 2026-12-01
+cxq list --format json
+cxq list --format md
+~~~
+
+With no new flags, `cxq list` output is exactly the old table. `cxq show 42`
+now renders the due date (with an `OVERDUE` marker), the task's age, the
+lease remaining, and the edit history.
+
+## Shared queue: server + remote mode
+
+Local mode is one SQLite file per repo. Shared mode is one server owning
+one SQLite file, with every agent connecting over HTTPS:
+
+~~~sh
+# On the machine that hosts the queue (a VM, Fly.io, ...):
+cxq serve --port 8080 --generate-token
+# prints the generated token once — save it; agents need it as CXQ_REMOTE_TOKEN
+
+# On every agent VM:
+export CXQ_REMOTE_URL="http://<host>:8080"
+export CXQ_REMOTE_TOKEN="<the token>"
+cxq remote status
+cxq list            # same commands, now against the shared queue
+cxq add "Fix flaky test" --priority 80
+cxq edit 42 --title "New title"
+cxq claim-next --agent codex --lease 2h --format prompt
+~~~
+
+`cxq serve` runs in the foreground (Ctrl-C stops it; no daemon inside cxq).
+It requires `CXQ_TOKEN` — set it, or pass `--generate-token` once. The
+server is Python 3 standard library only (`server/cxq_server.py`, no pip
+packages): it serves a single-file dashboard at `/` (kanban board, search
+and filters, click a card to view and edit it, create/claim/review/done
+buttons, dark mode, mobile-responsive, live refresh by polling every 5s)
+and a JSON API under `/api/v1/` (`/tasks`, `/board`, `/stats`, `/activity`,
+`/health`, …). All mutations validate exactly like the CLI — ids, statuses,
+transitions, due dates — and log events identically. Only `/health` is
+unauthenticated; everything else needs the Bearer token.
+
+When `CXQ_REMOTE_URL` is set, `list/show/add/edit/claim/claim-next/next/
+board/stats/activity/note/review/done/reopen/release/delete/block/deps/
+unblock/finding/prompt/stale/export/export-md` go through the HTTP API
+(requires `curl` + `python3` for JSON rendering). When it is unset, local
+mode is completely unchanged.
+
+**The server is the single writer.** Agents never point `sqlite3` at a
+shared file over NFS/SSHFS. See `deploy/README.md` for the free deployment
+options (Fly.io primary, Oracle Cloud Always Free VPS + Tailscale second),
+backup instructions (`cxq export` + volume snapshots + `sqlite3 .backup`),
+and token rotation.
+
+## Schema versions and migration
+
+The queue schema is versioned in `cxq_meta.schema_version` (v4 in 0.4.0,
+which adds the nullable `due_date` column). `cxq install` creates v4
+databases. A v3 database is migrated in place, preserving all data:
+
+~~~sh
+cxq migrate        # explicit; also refreshes an old stock .codex/tasks.schema.sql
+cxq list           # any command auto-migrates a v3 queue on open, with a notice
+cxq doctor         # reports repo_schema_version (expected 4) and remote mode
+~~~
+
+Databases older than v3 are not auto-migrated; they are reported by
+`cxq doctor` / `cxq update --repo` instead.
 
 ## Dependencies
 
@@ -541,6 +681,7 @@ Core fields:
 - `lease_until`
 - `result_summary`
 - `transcript_path`
+- `due_date` (nullable `YYYY-MM-DD`, schema v4)
 - timestamps
 
 Task dependencies are stored in `task_dependencies`, not in the legacy
@@ -555,11 +696,12 @@ After the MVP works, useful additions include:
 
 - `cxq run-next` to claim, render a prompt, call `codex exec`, and move the task
   to review
-- `cxq export-md` for a read-only Markdown mirror
 - branch naming like `codex/t42-auth-refresh-flake`
 - git worktree support for parallel agent runs
 - a global inbox that can move captured tasks into a repo-local queue
 - an MCP wrapper once the CLI contract proves useful
+- per-project queue namespacing on one server (today: one server = one queue)
+- per-agent tokens instead of a single shared token
 
 ## Design principle
 
