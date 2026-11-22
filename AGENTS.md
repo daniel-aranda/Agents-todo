@@ -11,8 +11,8 @@ The implementation is intentionally boring:
 - Bash for the CLI
 - git
 - sqlite3
-- Python 3 standard library only, for `server/cxq_server.py` and nothing else
-  (added in 0.4.0 for the shared-queue server; no pip packages, no Node)
+- Python 3 standard library only, for `server/cxq_server.py` and
+  `mcp/cxq_mcp.py` (added in 0.5.0 for the MCP wrapper; no pip packages, no Node)
 - no daemon (the server runs in the foreground; Fly/systemd own its lifecycle)
 - no external runtime dependencies
 
@@ -26,8 +26,9 @@ Important files:
 
 - `bin/cxq`: main CLI implementation.
 - `server/cxq_server.py`: shared-queue HTTP server (Python stdlib only).
+- `mcp/cxq_mcp.py`: MCP server wrapper over the CLI (Python stdlib only).
 - `deploy/`: Dockerfile, `fly.toml`, and deployment docs for the server.
-- `install.sh`: installs the local `cxq` command (and the server file).
+- `install.sh`: installs the local `cxq` command (and the server + MCP files).
 - `tests/run_tests.sh`: shell test suite (includes server smoke + remote-mode tests).
 - `Makefile`: test entrypoint.
 - `README.md`: public docs.
@@ -36,7 +37,8 @@ Important files:
 
 - Keep Bash portable for macOS and Linux.
 - Do not use GNU-only flags unless macOS supports them by default.
-- Keep the server Python-stdlib-only: `http.server` + `sqlite3`, no imports
+- Keep the server and the MCP wrapper Python-stdlib-only: `http.server` + `sqlite3`
+  for the server, `json` + `subprocess` for the MCP wrapper, no imports
   outside the standard library, no pip packages.
 - Remote mode (`CXQ_REMOTE_URL`) must go through the HTTP API; never point
   sqlite3 at a shared file over NFS/SSHFS. The server is the single writer.

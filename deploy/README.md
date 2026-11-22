@@ -54,7 +54,7 @@ On every agent VM (or in its shell profile / agent env):
 
 ~~~sh
 export CXQ_REMOTE_URL="https://cxq-queue.fly.dev"
-export CXQ_REMOTE_TOKEN="<the same token you set with fly secrets set>"
+export CXQ_REMOTE_TOKEN="<your agent's token — the legacy CXQ_TOKEN, or a per-agent token from `cxq tokens add <agent>`>"
 cxq remote status   # reachable: yes, plus server version + task counts
 cxq list            # now reads the shared queue, not a local .db
 cxq claim-next --agent <name> --lease 2h --format prompt
@@ -69,14 +69,30 @@ Local mode is unchanged when `CXQ_REMOTE_URL` is unset.
 
 ### Token rotation
 
+There are two tokens to rotate, and they rotate differently:
+
+**The legacy single token** (`CXQ_TOKEN`) — rotate by redeploying:
+
 ~~~sh
 NEW="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 fly secrets set CXQ_TOKEN="$NEW"   # redeploys; the old token stops working immediately
 # then update CXQ_REMOTE_TOKEN on every agent VM
 ~~~
 
-There is exactly one token for the whole queue. If it leaks, rotate it the
-same way. Do not put it in the repo, in a task, or in a screenshot.
+**Per-agent tokens** — rotate one agent without touching the others, no
+redeploy, from the server host (on Fly, `fly ssh console -C "cxq tokens
+rotate <agent> --db /data/tasks.db"`; on a VPS, run it where the DB lives):
+
+~~~sh
+cxq tokens rotate muse     # prints the new token once; the old one stops working immediately
+cxq tokens revoke muse     # revokes without re-issuing; rotate later to re-issue
+cxq tokens list --db /data/tasks.db   # who has a token, when each was last used
+~~~
+
+A revoked token stays revoked until rotated, and is rejected with 401 like
+an unknown token. The legacy token is unaffected by per-agent
+revoke/rotate, and vice versa. Do not put any token in the repo, in a task,
+or in a screenshot.
 
 ## Option B — Oracle Cloud Always Free VPS + Tailscale (truly $0, more setup)
 
@@ -151,7 +167,10 @@ still load.
 ## What the server does not do
 
 - No multi-queue namespacing (one server = one queue).
-- No per-user accounts or per-agent permissions — one shared token.
+- No per-user permissions — every token (legacy or per-agent) can do
+  everything; per-agent tokens only identify the actor, they do not
+  restrict what that agent may do. If a per-agent token leaks, revoke just
+  that one with `cxq tokens revoke <agent>`.
 - No TLS termination of its own — Fly.io terminates TLS; on a VPS, keep it
   behind Tailscale (Option B) or a reverse proxy with TLS.
 - No background daemon inside cxq — `cxq serve` runs in the foreground;
