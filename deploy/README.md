@@ -1,6 +1,6 @@
 # Deploying the shared cxq server
 
-Local mode is still the default: one SQLite file per repo (`.codex/tasks.db`).
+Local mode is still the default: one SQLite file per repo (`.cxq/tasks.db`).
 Shared mode adds one small server that owns the SQLite file, so every agent
 VM talks to the same queue over HTTPS. Agents **never** point `sqlite3` at a
 shared file over NFS/SSHFS — that corrupts SQLite. They use the HTTP API.
@@ -57,7 +57,7 @@ export CXQ_REMOTE_URL="https://cxq-queue.fly.dev"
 export CXQ_REMOTE_TOKEN="<the same token you set with fly secrets set>"
 cxq remote status   # reachable: yes, plus server version + task counts
 cxq list            # now reads the shared queue, not a local .db
-cxq claim-next --agent codex --lease 2h --format prompt
+cxq claim-next --agent <name> --lease 2h --format prompt
 ~~~
 
 One shared queue per repo/project: if you run several projects, deploy one

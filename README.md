@@ -9,7 +9,7 @@ only when a human accepts it. It is a SQLite queue with a small CLI, a
 kanban board, and (since v0.4.0) a shared server — not a full project
 manager or issue tracker, and deliberately not one.
 
-By default the queue is repo-local (`.codex/tasks.db`). Since v0.4.0 it can
+By default the queue is repo-local (`.cxq/tasks.db`). Since v0.4.0 it can
 also run **shared**: one small server owns the SQLite file and every agent
 VM talks to it over HTTPS (`cxq serve` + `CXQ_REMOTE_URL`), so all agents
 see the same board. The CLI, the dashboard, and the API all edit the same
@@ -23,10 +23,10 @@ cd Agents-todo
 ./install.sh                    # installs the global `cxq` command (macOS or Linux)
 
 cd /path/to/your/project
-cxq install                     # creates .codex/tasks.db for this repo
+cxq install                     # creates .cxq/tasks.db for this repo
 cxq add "Fix flaky auth refresh test" --priority 80
 cxq board                       # see the queue
-cxq claim-next --agent codex --lease 2h --format prompt
+cxq claim-next --lease 2h --format prompt
 ~~~
 
 That last command hands the next task to your agent, with the full task
@@ -91,7 +91,7 @@ id  status  priority  title
 
 Then hand the next task to your agent:
 ~~~bash
-cxq claim-next --agent codex --lease 2h --format prompt
+cxq claim-next --lease 2h --format prompt
 ~~~
 
 ## Requirements
@@ -137,13 +137,25 @@ truth and exposes safe, predictable commands for humans and agents.
 SQLite      = state
 cxq         = API
 AGENTS.md   = agent protocol
-Codex       = worker
+Agent       = worker
 Git         = project boundary
 ~~~
 
 ## Project-local queues
 
 `cxq` uses one queue per repository.
+
+The queue files live in `.cxq/` at the repo root. `cxq` is multi-agent,
+and any agent can claim and work tasks through the CLI, whatever name it
+claims with.
+
+Queues created before v0.4.0 lived in `.codex/` instead. The first `cxq`
+command in such a repo migrates the queue to `.cxq/` in place — database,
+schema, prompt, and `.gitignore` entries — preserving every task and
+event. A half-moved queue (template files already in `.cxq/`, database
+still in `.codex/`) is finished the same way. Only a genuine conflict — a
+database in *both* directories — is left alone with a warning, and
+`.cxq/` wins then.
 
 When you run:
 
@@ -154,8 +166,8 @@ cxq install
 from the root of a Git project, it creates the local queue files needed for that
 project.
 
-`cxq install` is non-destructive. If `.codex/tasks.schema.sql` or
-`.codex/prompts/task.md` already exists, it leaves the file unchanged and prints
+`cxq install` is non-destructive. If `.cxq/tasks.schema.sql` or
+`.cxq/prompts/task.md` already exists, it leaves the file unchanged and prints
 a message saying so.
 
 Expected project layout:
@@ -164,7 +176,7 @@ Expected project layout:
 your-project/
   AGENTS.md
   .gitignore
-  .codex/
+  .cxq/
     tasks.db
     tasks.schema.sql
     prompts/
@@ -174,8 +186,8 @@ your-project/
 The SQLite database is local state and should not be committed:
 
 ~~~text
-.codex/tasks.db
-.codex/tasks.db-*
+.cxq/tasks.db
+.cxq/tasks.db-*
 ~~~
 
 The schema and prompt templates can be committed so the project documents how
@@ -192,7 +204,7 @@ message:
 cxq install only runs at the root of a Git project.
 ~~~
 
-This protects random directories from getting `.codex` files and makes the
+This protects random directories from getting `.cxq` files and makes the
 project boundary explicit.
 
 ## Command surface
@@ -215,8 +227,8 @@ cxq add "Fix flaky auth refresh test"
 cxq list
 cxq next
 cxq show 42
-cxq claim 42 --agent codex --lease 2h
-cxq claim-next --agent codex --lease 2h --format prompt
+cxq claim 42 --agent <name> --lease 2h
+cxq claim-next --lease 2h --format prompt
 cxq block 42 --by 17
 cxq deps 42
 cxq unblock 42 --by 17
@@ -284,7 +296,7 @@ cxq add "Refactor billing webhook verifier" \
 Then an agent can claim and work the task:
 
 ~~~sh
-cxq claim-next --agent codex --lease 2h --format prompt
+cxq claim-next --lease 2h --format prompt
 ~~~
 
 `cxq show 42` renders the current task fields and recent events.
@@ -346,7 +358,7 @@ cxq watch --interval 10s
 `cxq list` also grew filters that compose:
 
 ~~~sh
-cxq list --status review --tag security --agent codex
+cxq list --status review --tag security --agent <name>
 cxq list --priority-min 80 --search "auth refresh" --overdue --due-before 2026-12-01
 cxq list --format json
 cxq list --format md
@@ -373,7 +385,7 @@ cxq remote status
 cxq list            # same commands, now against the shared queue
 cxq add "Fix flaky test" --priority 80
 cxq edit 42 --title "New title"
-cxq claim-next --agent codex --lease 2h --format prompt
+cxq claim-next --lease 2h --format prompt
 ~~~
 
 `cxq serve` runs in the foreground (Ctrl-C stops it; no daemon inside cxq).
@@ -406,7 +418,7 @@ which adds the nullable `due_date` column). `cxq install` creates v4
 databases. A v3 database is migrated in place, preserving all data:
 
 ~~~sh
-cxq migrate        # explicit; also refreshes an old stock .codex/tasks.schema.sql
+cxq migrate        # explicit; also refreshes an old stock .cxq/tasks.schema.sql
 cxq list           # any command auto-migrates a v3 queue on open, with a notice
 cxq doctor         # reports repo_schema_version (expected 4) and remote mode
 ~~~
@@ -557,7 +569,7 @@ CXQ_SQLITE_MAX_ATTEMPTS=5
 Claims should have leases:
 
 ~~~sh
-cxq claim 42 --agent codex --lease 2h
+cxq claim 42 --agent <name> --lease 2h
 ~~~
 
 If an agent crashes, the task should not be stuck forever. Expired claims can be
@@ -646,7 +658,7 @@ Git or GitHub.
 
 ## Agent contract
 
-`cxq install` should create or update an `AGENTS.md` section that tells Codex how
+`cxq install` should create or update an `AGENTS.md` section that tells agents how
 to use the queue.
 
 Recommended contract:
@@ -654,13 +666,13 @@ Recommended contract:
 ~~~md
 ## Local task queue
 
-This repo uses a local Codex task queue.
+This repo uses a local agent task queue.
 
-Use `cxq` to read and update tasks. Do not edit `.codex/tasks.db` directly.
+Use `cxq` to read and update tasks. Do not edit `.cxq/tasks.db` directly.
 
 Before starting queued work:
 
-1. Claim exactly one task with `cxq claim-next --agent codex --lease 2h --format prompt`.
+1. Claim exactly one task with `cxq claim-next --lease 2h --format prompt`.
 2. Work only on the claimed task.
 3. Respect `allowed_paths` unless the task clearly requires more scope.
 4. Run the task's `verify_command` when present.
@@ -721,9 +733,9 @@ human, watcher, or agent touches the queue.
 
 Useful additions for later (none of these changes the core workflow):
 
-- `cxq run-next` to claim, render a prompt, call `codex exec`, and move the task
+- `cxq run-next` to claim, render a prompt, call your agent's runner, and move the task
   to review
-- branch naming like `codex/t42-auth-refresh-flake`
+- branch naming like `agent/t42-auth-refresh-flake`
 - git worktree support for parallel agent runs
 - a global inbox that can move captured tasks into a repo-local queue
 - an MCP wrapper once the CLI contract proves useful

@@ -699,7 +699,7 @@ class Handler(BaseHTTPRequestHandler):
             return {"blocked_by": blocked_by, "blocks": blocks}
 
     def task_claim(self, task_id, body):
-        agent = body.get("agent", "codex")
+        agent = body.get("agent", "agent")
         lease = body.get("lease", "2h")
         try:
             until = lease_modifier(lease)
@@ -723,7 +723,7 @@ class Handler(BaseHTTPRequestHandler):
                 return get_task(c, task_id, include_events=True)
 
     def claim_next(self, body):
-        agent = body.get("agent", "codex")
+        agent = body.get("agent", "agent")
         lease = body.get("lease", "2h")
         try:
             until = lease_modifier(lease)
