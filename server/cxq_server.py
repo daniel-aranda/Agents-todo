@@ -35,8 +35,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.0-dev"
-SCHEMA_VERSION = 4
+VERSION = "0.5.0-dev"
+SCHEMA_VERSION = 6
 STATUSES = ["inbox", "ready", "claimed", "blocked", "review", "done", "wontfix"]
 
 # Same single source of truth as `cxq status-transitions` in bin/cxq.
@@ -51,19 +51,22 @@ TRANSITIONS = {
     ("wontfix", "ready"), ("wontfix", "inbox"),
 }
 
-SCHEMA_SQL = """
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS tasks (
+# The tasks table definition, shared by SCHEMA_SQL (fresh installs) and
+# ensure_schema() (table rebuild when migrating a pre-v5 database whose
+# CHECK lacks 'trashed' — SQLite cannot ALTER a CHECK constraint).
+# Keep in sync with tasks_table_sql() in bin/cxq.
+TASKS_TABLE_SQL = """
+CREATE TABLE tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   body TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'inbox'
-    CHECK (status IN ('inbox','ready','claimed','blocked','review','done','wontfix')),
+    CHECK (status IN ('inbox','ready','claimed','blocked','review','done','wontfix','trashed')),
   priority INTEGER NOT NULL DEFAULT 50,
   due_date TEXT,
   recurs TEXT,
+  trashed_from_status TEXT,
+  trashed_at TEXT,
   repo_path TEXT NOT NULL,
   branch TEXT,
   allowed_paths_json TEXT NOT NULL DEFAULT '[]',
@@ -79,6 +82,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+"""
+
+SCHEMA_SQL = """
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+""" + TASKS_TABLE_SQL.replace(
+    "CREATE TABLE tasks (", "CREATE TABLE IF NOT EXISTS tasks (", 1) + """
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority DESC, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_path, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_date);
@@ -116,8 +127,8 @@ CREATE TABLE IF NOT EXISTS task_findings (
 CREATE INDEX IF NOT EXISTS idx_task_findings_task_status ON task_findings(task_id, status);
 
 CREATE TABLE IF NOT EXISTS cxq_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT OR IGNORE INTO cxq_meta (key, value) VALUES ('schema_version', '4');
-UPDATE cxq_meta SET value = '4' WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 4;
+INSERT OR IGNORE INTO cxq_meta (key, value) VALUES ('schema_version', '6');
+UPDATE cxq_meta SET value = '6' WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 6;
 
 -- Per-agent API tokens (managed with `cxq tokens` on the server host).
 -- One row per agent; the full token is stored, same trust model as the
@@ -165,13 +176,42 @@ def connect():
 
 
 def ensure_schema(conn):
-    # Add due_date before applying the schema: the schema creates an index
+    # Add columns before applying the schema: the schema creates an index
     # on due_date, which fails on a v3 table that lacks the column.
+    # Mirrors migrate_db() in bin/cxq: v5 adds the 'trashed' status, which
+    # needs a new CHECK constraint, and SQLite cannot ALTER a CHECK, so a
+    # pre-v5 tasks table is rebuilt in place (same ids, same rows).
     cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]
-    if cols and "due_date" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
-    if cols and "recurs" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN recurs TEXT")
+    for col, ddl in (("due_date", "ALTER TABLE tasks ADD COLUMN due_date TEXT"),
+                     ("recurs", "ALTER TABLE tasks ADD COLUMN recurs TEXT"),
+                     ("trashed_from_status",
+                      "ALTER TABLE tasks ADD COLUMN trashed_from_status TEXT"),
+                     ("trashed_at", "ALTER TABLE tasks ADD COLUMN trashed_at TEXT")):
+        if cols and col not in cols:
+            conn.execute(ddl)
+    if cols:
+        table_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+        ).fetchone()[0] or ""
+        # Match the quoted CHECK literal: the bare word also appears in
+        # the trashed_from_status / trashed_at column names added above,
+        # which must NOT count as a migrated CHECK.
+        if "'trashed'" not in table_sql:
+            conn.execute("DROP TRIGGER IF EXISTS trg_tasks_updated_at")
+            conn.execute("ALTER TABLE tasks RENAME TO tasks_migrate_old")
+            conn.execute(TASKS_TABLE_SQL)
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, status, priority, due_date,"
+                " recurs, repo_path, branch, allowed_paths_json, tags_json,"
+                " deps_json, acceptance, verify_command, claimed_by, claimed_at,"
+                " lease_until, result_summary, transcript_path, created_at,"
+                " updated_at, trashed_from_status, trashed_at)"
+                " SELECT id, title, body, status, priority, due_date, recurs,"
+                " repo_path, branch, allowed_paths_json, tags_json, deps_json,"
+                " acceptance, verify_command, claimed_by, claimed_at, lease_until,"
+                " result_summary, transcript_path, created_at, updated_at,"
+                " NULL, NULL FROM tasks_migrate_old")
+            conn.execute("DROP TABLE tasks_migrate_old")
     conn.executescript(SCHEMA_SQL)
     conn.commit()
 
@@ -269,7 +309,7 @@ def task_dict(row, conn=None, include_events=False):
         today = dt.datetime.now(dt.timezone.utc).date().isoformat()
         d["overdue"] = bool(
             d.get("due_date") and d["due_date"] < today
-            and d.get("status") not in ("done", "wontfix"))
+            and d.get("status") not in ("done", "wontfix", "trashed"))
         d["lease_expired"] = bool(
             d.get("status") == "claimed" and d.get("lease_until")
             and d["lease_until"] < now_iso())
@@ -326,15 +366,22 @@ def board_data(conn):
         " priority DESC, created_at ASC").fetchall()
     columns = {s: [] for s in STATUSES}
     for r in rows:
-        columns[r["status"]].append(task_dict(r, conn))
+        # Trashed tasks are not a board column: skip them instead of
+        # KeyErroring (a trashed task used to 500 the whole board).
+        if r["status"] in columns:
+            columns[r["status"]].append(task_dict(r, conn))
     return {"columns": columns,
             "counts": {s: len(columns[s]) for s in STATUSES}}
 
 
 def stats_data(conn):
-    by_status = {s: 0 for s in STATUSES}
+    # by_status covers the board statuses plus trashed (mirrors the CLI's
+    # `status_trashed` count); unknown statuses are ignored instead of
+    # KeyErroring, the same way board_data skips trashed rows.
+    by_status = {s: 0 for s in STATUSES + ["trashed"]}
     for r in conn.execute("SELECT status, COUNT(*) n FROM tasks GROUP BY status"):
-        by_status[r["status"]] = r["n"]
+        if r["status"] in by_status:
+            by_status[r["status"]] = r["n"]
     today = dt.datetime.now(dt.timezone.utc).date().isoformat()
     overdue = conn.execute(
         "SELECT COUNT(*) FROM tasks WHERE due_date IS NOT NULL"
@@ -556,6 +603,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/due" and method == "GET":
             with connect() as c:
                 return due_data(c)
+        if path == "/api/v1/digest" and method == "GET":
+            with connect() as c:
+                groups = due_data(c)
+                return {"generated_at": now_iso(),
+                        "date": dt.datetime.now(dt.timezone.utc).date().isoformat(),
+                        "overdue_count": len(groups["overdue"]),
+                        "today_count": len(groups["today"]),
+                        "tomorrow_count": len(groups["tomorrow"]),
+                        "overdue": groups["overdue"],
+                        "today": groups["today"],
+                        "tomorrow": groups["tomorrow"]}
+        if path == "/api/v1/trash" and method == "GET":
+            with connect() as c:
+                rows = c.execute(
+                    "SELECT id, priority, title, trashed_from_status,"
+                    " trashed_at FROM tasks WHERE status = 'trashed'"
+                    " ORDER BY trashed_at ASC, id ASC").fetchall()
+                return {"tasks": [dict(r) for r in rows]}
+        if path == "/api/v1/trash/purge" and method == "POST":
+            return self.purge_trash(body)
         if path == "/api/v1/activity" and method == "GET":
             return self.activity(qs)
         if path == "/api/v1/stale" and method == "GET":
@@ -589,7 +656,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and sub == "findings":
                 return self.add_finding(task_id, body)
             if method == "POST" and sub in ("claim", "release", "review", "done",
-                                            "note", "reopen", "block", "unblock"):
+                                            "note", "reopen", "block", "unblock",
+                                            "restore", "undo"):
                 return getattr(self, "task_" + sub)(task_id, body)
 
         m = re.fullmatch(r"/api/v1/findings/(\d+)/resolve", path)
@@ -612,7 +680,7 @@ class Handler(BaseHTTPRequestHandler):
                 rows = c.execute(
                     "SELECT t.* FROM tasks t JOIN task_events e ON e.task_id = t.id"
                     " WHERE e.event_type = 'note' AND (e.note LIKE 'DUDA:%' OR e.note LIKE 'BLOCKER:%')"
-                    " AND t.status NOT IN ('done','wontfix')"
+                    " AND t.status NOT IN ('done','wontfix','trashed')"
                     " ORDER BY e.id ASC").fetchall()
                 return {"tasks": [task_dict(r, c) for r in rows]}
             if qs.get("status"):
@@ -621,7 +689,8 @@ class Handler(BaseHTTPRequestHandler):
                 where.append("status = ?")
                 params.append(qs["status"][0])
             elif qs.get("all", [""])[0] != "1":
-                where.append("status NOT IN ('done','wontfix')")
+                # Default listing hides finished and trashed tasks, like the CLI.
+                where.append("status NOT IN ('done','wontfix','trashed')")
             if qs.get("tag"):
                 where.append("EXISTS (SELECT 1 FROM json_each(tags_json) WHERE value = ?)")
                 params.append(qs["tag"][0])
@@ -640,7 +709,7 @@ class Handler(BaseHTTPRequestHandler):
                 params += [q, q, q]
             if qs.get("overdue", [""])[0] == "1":
                 where.append("due_date IS NOT NULL AND due_date < date('now')"
-                             " AND status NOT IN ('done','wontfix')")
+                             " AND status NOT IN ('done','wontfix','trashed')")
             if qs.get("due_before"):
                 if not valid_due_date(qs["due_before"][0]):
                     raise ApiError(400, "due_before must be a valid YYYY-MM-DD date.")
@@ -706,6 +775,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError(404, "task not found: %s" % task_id)
                 old = dict(row)
                 sets, diffs = {}, []
+                # Undo data: previous values of exactly the fields this edit
+                # changes, stored in the 'edited' event so the undo endpoint
+                # can revert it. Same keys/format as `cxq edit` (task #7):
+                # strings verbatim, priority a number, nullable fields null
+                # when empty, allowed_paths/tags as JSON arrays.
+                prev = {}
 
                 def change(field, column, new):
                     if new is None or new == old[column]:
@@ -714,6 +789,7 @@ class Handler(BaseHTTPRequestHandler):
                     disp_new = new if new not in (None, "") else "(empty)"
                     diffs.append("%s: %s -> %s" % (field, disp_old, disp_new))
                     sets[column] = new
+                    prev[column] = old[column]
 
                 if "title" in body:
                     change("title", "title", body["title"])
@@ -743,6 +819,7 @@ class Handler(BaseHTTPRequestHandler):
                         if old["recurs"] is not None:
                             diffs.append("recurs: %s -> (empty)" % old["recurs"])
                             sets["recurs"] = None
+                            prev["recurs"] = old["recurs"]
                     else:
                         change("recurs", "recurs", r)
                 # A recurring task must always have a due date (effective
@@ -786,11 +863,13 @@ class Handler(BaseHTTPRequestHandler):
                         ",".join(json_list(old["allowed_paths_json"])) or "(empty)",
                         ",".join(files) or "(empty)"))
                     sets["allowed_paths_json"] = json.dumps(files)
+                    prev["allowed_paths"] = json_list(old["allowed_paths_json"])
                 if tags != json_list(old["tags_json"]):
                     diffs.append("tags: %s -> %s" % (
                         ",".join(json_list(old["tags_json"])) or "(empty)",
                         ",".join(tags) or "(empty)"))
                     sets["tags_json"] = json.dumps(tags)
+                    prev["tags"] = json_list(old["tags_json"])
                 # status last: validated against the transitions table.
                 if "status" in body and body["status"] != old["status"]:
                     new_status = body["status"]
@@ -808,6 +887,10 @@ class Handler(BaseHTTPRequestHandler):
                     if body.get("reason"):
                         diffs[-1] += " (reason: %s)" % body["reason"]
                     sets["status"] = new_status
+                    prev["status"] = old["status"]
+                    prev["claimed_by"] = old["claimed_by"]
+                    prev["claimed_at"] = old["claimed_at"]
+                    prev["lease_until"] = old["lease_until"]
                     if new_status in ("ready", "inbox", "blocked", "done"):
                         sets["claimed_by"] = None
                         sets["claimed_at"] = None
@@ -819,7 +902,8 @@ class Handler(BaseHTTPRequestHandler):
                         "%s = ?" % k for k in sets) + " WHERE id = ?"
                     c.execute(sql, list(sets.values()) + [task_id])
                 diff_text = "; ".join(diffs)
-                log_event(c, task_id, "edited", actor_from(self, body), diff_text)
+                log_event(c, task_id, "edited", actor_from(self, body), diff_text,
+                          prev if prev else None)
                 next_id, next_due = None, None
                 if sets.get("status") == "done" and old["status"] != "done":
                     eff = dict(old)
@@ -830,20 +914,151 @@ class Handler(BaseHTTPRequestHandler):
                         "next_occurrence_id": next_id, "next_occurrence_due": next_due}
 
     def delete_task(self, task_id, qs):
+        # Delete moves the task to trash instead of removing the row, so it
+        # can be restored — same as `cxq delete` (task #7). Permanent
+        # removal is purge_trash() only.
         if qs.get("force", [""])[0] != "1":
             raise ApiError(400, "deleting a task requires force=1.")
         with WRITE_LOCK:
             with connect() as c:
-                row = c.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                row = c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
                 if row is None:
                     raise ApiError(404, "task not found: %s" % task_id)
-                c.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-                c.execute("DELETE FROM task_findings WHERE task_id = ?", (task_id,))
-                c.execute("DELETE FROM task_dependencies WHERE task_id = ? OR blocker_task_id = ?",
-                          (task_id, task_id))
-                c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                if row["status"] == "trashed":
+                    raise ApiError(400, "task %s is already trashed; purge the trash"
+                                   " to delete it permanently." % task_id)
+                c.execute(
+                    "UPDATE tasks SET status = 'trashed',"
+                    " trashed_from_status = ?, trashed_at = ?,"
+                    " claimed_by = NULL, claimed_at = NULL, lease_until = NULL"
+                    " WHERE id = ?",
+                    (row["status"], now_iso(), task_id))
+                log_event(c, task_id, "trashed", actor_from(self, {}),
+                          "trashed from %s; restore with 'cxq restore %s'"
+                          % (row["status"], task_id))
                 c.commit()
-                return {"deleted": task_id}
+                return {"trashed": task_id, "was": row["status"]}
+
+    def task_restore(self, task_id, body):
+        # Mirror `cxq restore`: back to the pre-trash status; a trashed
+        # claim lost its agent and lease, so it lands on 'ready'.
+        with WRITE_LOCK:
+            with connect() as c:
+                row = c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if row is None:
+                    raise ApiError(404, "task not found: %s" % task_id)
+                if row["status"] != "trashed":
+                    raise ApiError(400, "task %s is not trashed (status: %s)."
+                                   % (task_id, row["status"]))
+                dest = row["trashed_from_status"] or "ready"
+                if dest == "claimed":
+                    dest = "ready"
+                c.execute(
+                    "UPDATE tasks SET status = ?, trashed_from_status = NULL,"
+                    " trashed_at = NULL WHERE id = ?",
+                    (dest, task_id))
+                log_event(c, task_id, "restored", actor_from(self, body),
+                          "restored to %s" % dest)
+                c.commit()
+                return {"task": get_task(c, task_id, include_events=True),
+                        "restored_to": dest}
+
+    def task_undo(self, task_id, body):
+        # Mirror `cxq undo`: revert the most recent 'edited' event that has
+        # not been undone yet, using the previous values stored in its
+        # data_json (recorded by edit_task). One call reverts one edit.
+        with WRITE_LOCK:
+            with connect() as c:
+                row = c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                if row is None:
+                    raise ApiError(404, "task not found: %s" % task_id)
+                if row["status"] == "trashed":
+                    raise ApiError(400, "task %s is trashed; restore it first with"
+                                   " 'cxq restore %s'." % (task_id, task_id))
+                edit = c.execute(
+                    "SELECT id, data_json FROM task_events e WHERE e.task_id = ?"
+                    " AND e.event_type = 'edited' AND NOT EXISTS ("
+                    "  SELECT 1 FROM task_events u WHERE u.task_id = ?"
+                    "  AND u.event_type = 'undone'"
+                    "  AND CAST(json_extract(u.data_json, '$.undid_edit_id') AS INTEGER)"
+                    "    = e.id)"
+                    " ORDER BY e.id DESC LIMIT 1",
+                    (task_id, task_id)).fetchone()
+                if edit is None:
+                    raise ApiError(400, "task %s has nothing to undo." % task_id)
+                try:
+                    prev = json.loads(edit["data_json"] or "{}")
+                except ValueError:
+                    prev = {}
+                if not isinstance(prev, dict) or not prev:
+                    raise ApiError(400, "the last edit of task %s cannot be undone"
+                                   " (no previous values recorded)." % task_id)
+                columns = {"title": "title", "body": "body", "priority": "priority",
+                           "status": "status", "acceptance": "acceptance",
+                           "verify_command": "verify_command", "branch": "branch",
+                           "due_date": "due_date", "recurs": "recurs",
+                           "allowed_paths": "allowed_paths_json",
+                           "tags": "tags_json", "claimed_by": "claimed_by",
+                           "claimed_at": "claimed_at", "lease_until": "lease_until"}
+                sets, values, reverted = {}, [], []
+                for key, value in prev.items():
+                    if key not in columns:
+                        continue
+                    if key == "priority":
+                        if not isinstance(value, int) or isinstance(value, bool):
+                            raise ApiError(400, "cannot undo task %s: stored priority"
+                                           " is not an integer." % task_id)
+                    if key == "status" and value not in STATUSES:
+                        raise ApiError(400, "cannot undo task %s: stored status"
+                                       " is not valid." % task_id)
+                    sets[columns[key]] = value
+                    values.append(value)
+                    reverted.append(key)
+                if not sets:
+                    raise ApiError(400, "the last edit of task %s cannot be undone"
+                                   " (no previous values recorded)." % task_id)
+                sql = "UPDATE tasks SET " + ", ".join(
+                    "%s = ?" % k for k in sets) + " WHERE id = ?"
+                c.execute(sql, values + [task_id])
+                log_event(c, task_id, "undone", actor_from(self, body),
+                          "undid edit: %s" % ", ".join(reverted),
+                          {"undid_edit_id": edit["id"]})
+                c.commit()
+                return {"task": get_task(c, task_id, include_events=True),
+                        "reverted": reverted}
+
+    def purge_trash(self, body):
+        # Mirror `cxq trash purge`: permanently delete trashed tasks older
+        # than N days (default 30), or all of them with {"all": true}.
+        # Purged tasks are gone for real: row, events, findings, deps.
+        days = body.get("days", 30)
+        all_flag = body.get("all", False)
+        if not all_flag:
+            if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+                raise ApiError(400, "--days must be a non-negative integer.")
+        with WRITE_LOCK:
+            with connect() as c:
+                if all_flag:
+                    where = "status = 'trashed'"
+                    params = []
+                else:
+                    where = ("status = 'trashed' AND trashed_at <"
+                             " strftime('%Y-%m-%dT%H:%M:%fZ','now',?)")
+                    params = ["-%d days" % days]
+                count = c.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE " + where, params).fetchone()[0]
+                if count:
+                    c.execute("DELETE FROM task_events WHERE task_id IN"
+                              " (SELECT id FROM tasks WHERE " + where + ")", params)
+                    c.execute("DELETE FROM task_findings WHERE task_id IN"
+                              " (SELECT id FROM tasks WHERE " + where + ")", params)
+                    c.execute("DELETE FROM task_dependencies WHERE task_id IN"
+                              " (SELECT id FROM tasks WHERE " + where + ")"
+                              " OR blocker_task_id IN"
+                              " (SELECT id FROM tasks WHERE " + where + ")", params * 2)
+                    c.execute("DELETE FROM tasks WHERE " + where, params)
+                c.commit()
+                return {"purged": count}
 
     def task_prompt(self, task_id):
         with connect() as c:

@@ -31,6 +31,7 @@ Usage:
   cxq add <title> [options]
   cxq list [--all] [--status <status>] [--needs-action] [--questions]
   cxq due [--format json|table|md]
+  cxq digest [--format json|table|md]
   cxq next [--format text|id|md]
   cxq show <id>
   cxq claim <id> [--agent <name>] [--lease <duration>]
@@ -1539,8 +1540,68 @@ cmd_due() {
   db=$(db_path_or_die)
 
   if [ "$format" = "json" ]; then
-    sqlite_run "$db" "SELECT id, status, priority, title, due_date, CASE WHEN due_date < date('now') THEN 'overdue' WHEN due_date = date('now') THEN 'today' ELSE 'tomorrow' END AS due_group FROM tasks WHERE due_date IS NOT NULL AND due_date <= date('now', '+1 day') AND status NOT IN ('done', 'wontfix', 'trashed') ORDER BY due_date ASC, priority DESC, created_at ASC;" -json
+    # sqlite3 -json prints nothing for zero rows; default to [] so the
+    # output is always valid JSON.
+    local tasks_json
+    tasks_json=$(sqlite_run "$db" "SELECT id, status, priority, title, due_date, CASE WHEN due_date < date('now') THEN 'overdue' WHEN due_date = date('now') THEN 'today' ELSE 'tomorrow' END AS due_group FROM tasks WHERE due_date IS NOT NULL AND due_date <= date('now', '+1 day') AND status NOT IN ('done', 'wontfix', 'trashed') ORDER BY due_date ASC, priority DESC, created_at ASC;" -json)
+    printf '%s\n' "${tasks_json:-[]}"
     return
+  fi
+  due_section "$db" "Overdue:" "due_date IS NOT NULL AND due_date < date('now') AND status NOT IN ('done', 'wontfix', 'trashed')" "$format"
+  due_section "$db" "Due today:" "due_date = date('now') AND status NOT IN ('done', 'wontfix', 'trashed')" "$format"
+  due_section "$db" "Due tomorrow:" "due_date = date('now', '+1 day') AND status NOT IN ('done', 'wontfix', 'trashed')" "$format"
+}
+
+# `cxq digest`: the daily overdue digest — overdue + due today + due
+# tomorrow, with a one-line summary and the date. No daemon, no email:
+# wire it to a daily cron (see README) or paste `--format md` into chat.
+# Same date definition and groups as `cxq due` (SQLite date('now'), UTC).
+cmd_digest() {
+  require_sqlite3
+
+  local format="table"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --format)
+        [ "$#" -ge 2 ] || die "--format requires a value."
+        format=$2
+        case "$format" in
+          json|table|md) ;;
+          *) die "invalid format: $format" ;;
+        esac
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown digest option: $1"
+        ;;
+    esac
+  done
+
+  local db today overdue today_n tomorrow_n
+  db=$(db_path_or_die)
+  today=$(sqlite_value "$db" "SELECT date('now');")
+  overdue=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE due_date IS NOT NULL AND due_date < date('now') AND status NOT IN ('done', 'wontfix', 'trashed');")
+  today_n=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE due_date = date('now') AND status NOT IN ('done', 'wontfix', 'trashed');")
+  tomorrow_n=$(sqlite_value "$db" "SELECT COUNT(*) FROM tasks WHERE due_date = date('now', '+1 day') AND status NOT IN ('done', 'wontfix', 'trashed');")
+
+  if [ "$format" = "json" ]; then
+    # sqlite3 -json prints nothing for zero rows; default to [] so the
+    # output is always valid JSON.
+    local tasks_json
+    tasks_json=$(sqlite_run "$db" "SELECT id, status, priority, title, due_date, CASE WHEN due_date < date('now') THEN 'overdue' WHEN due_date = date('now') THEN 'today' ELSE 'tomorrow' END AS due_group FROM tasks WHERE due_date IS NOT NULL AND due_date <= date('now', '+1 day') AND status NOT IN ('done', 'wontfix', 'trashed') ORDER BY due_date ASC, priority DESC, created_at ASC;" -json)
+    printf '{"date": "%s", "overdue_count": %s, "today_count": %s, "tomorrow_count": %s, "tasks": %s}\n' "$today" "$overdue" "$today_n" "$tomorrow_n" "${tasks_json:-[]}"
+    return 0
+  fi
+
+  printf '# cxq digest — %s\n\n' "$today"
+  printf 'Overdue: %s | Due today: %s | Due tomorrow: %s\n\n' "$overdue" "$today_n" "$tomorrow_n"
+  if [ "$overdue" = "0" ] && [ "$today_n" = "0" ] && [ "$tomorrow_n" = "0" ]; then
+    printf 'All clear — nothing overdue or due in the next 2 days.\n'
+    return 0
   fi
   due_section "$db" "Overdue:" "due_date IS NOT NULL AND due_date < date('now') AND status NOT IN ('done', 'wontfix', 'trashed')" "$format"
   due_section "$db" "Due today:" "due_date = date('now') AND status NOT IN ('done', 'wontfix', 'trashed')" "$format"
@@ -3736,6 +3797,15 @@ elif kind == "stats":
 elif kind == "activity":
     for e in data.get("events", []):
         print("%s  #%s  %s  by %s  %s" % (e.get("created_at"), e.get("task_id"), e.get("event_type"), e.get("actor"), e.get("note", "")))
+elif kind == "trash":
+    tasks = data.get("tasks", [])
+    print("# cxq trash\n")
+    if not tasks:
+        print("(empty)")
+    else:
+        print("%-4s %-8s %-40s %-10s %s" % ("id", "priority", "title", "from", "trashed_at"))
+        for t in tasks:
+            print("%-4s %-8s %-40s %-10s %s" % (t.get("id"), t.get("priority"), (t.get("title") or "")[:40], show(t.get("trashed_from_status")), show(t.get("trashed_at"))))
 elif kind == "deps":
     print("# Dependencies")
     print("Blocked by:")
@@ -3860,6 +3930,41 @@ cmd_remote_dispatch() {
         json) cat "$resp_file"; printf '\n' ;;
         md) remote_render due_md "$resp_file" ;;
         table) remote_render due "$resp_file" ;;
+      esac
+      ;;
+    digest)
+      local format="table"
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --format) format=$2; shift 2 ;;
+          --help|-h) usage; exit 0 ;;
+          *) die "unknown digest option: $1" ;;
+        esac
+      done
+      case "$format" in
+        json|table|md) ;;
+        *) die "invalid format: $format" ;;
+      esac
+      remote_api GET "/api/v1/digest" >"$resp_file"
+      case "$format" in
+        json) cat "$resp_file"; printf '\n' ;;
+        md|table)
+          local oc tc mc
+          oc=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("overdue_count", 0))' "$resp_file")
+          tc=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("today_count", 0))' "$resp_file")
+          mc=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("tomorrow_count", 0))' "$resp_file")
+          local ddate
+          ddate=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("date", ""))' "$resp_file")
+          printf '# cxq digest — %s\n\n' "$ddate"
+          printf 'Overdue: %s | Due today: %s | Due tomorrow: %s\n\n' "$oc" "$tc" "$mc"
+          if [ "$oc" = "0" ] && [ "$tc" = "0" ] && [ "$mc" = "0" ]; then
+            printf 'All clear — nothing overdue or due in the next 2 days.\n'
+          elif [ "$format" = "md" ]; then
+            remote_render due_md "$resp_file"
+          else
+            remote_render due "$resp_file"
+          fi
+          ;;
       esac
       ;;
     next)
@@ -4050,7 +4155,7 @@ cmd_remote_dispatch() {
       if [ "$force" -ne 1 ]; then
         if gate_is_interactive; then
           local answer
-          printf 'Delete task #%s (%s)? This cannot be undone. [y/N] ' "$id" "$status" >&2
+          printf 'Move task #%s (%s) to trash? Restore it later with %s. [y/N] ' "$id" "$status" "'cxq restore $id'" >&2
           answer=$(gate_read_answer); printf '\n' >&2
           case "$answer" in y|Y|yes|YES|Yes) ;; *) die "task $id was not deleted." ;; esac
         else
@@ -4058,13 +4163,56 @@ cmd_remote_dispatch() {
         fi
       fi
       remote_api DELETE "/api/v1/tasks/$id?force=1" >"$resp_file"
-      printf 'Deleted task #%s\n' "$id"
+      local was
+      was=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("was",""))' "$resp_file")
+      printf 'Trashed task #%s (was %s). Restore with %s.\n' "$id" "$was" "'cxq restore $id'"
       ;;
-    restore|undo|trash)
-      # The server has no trash/undo endpoints yet; remote parity is a
-      # follow-up task. Fail clearly instead of touching a local database
-      # that remote mode does not own.
-      die "cxq $command is not supported in remote mode yet."
+    restore)
+      [ "$#" -eq 1 ] || die "usage: cxq restore <id>"
+      require_task_id "$1"
+      body_file=$(json_body_file)
+      remote_api POST "/api/v1/tasks/$1/restore" "$body_file" >"$resp_file"
+      local restored_to
+      restored_to=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("restored_to",""))' "$resp_file")
+      printf 'Restored task #%s to %s\n' "$1" "$restored_to"
+      ;;
+    undo)
+      [ "$#" -eq 1 ] || die "usage: cxq undo <id>"
+      require_task_id "$1"
+      body_file=$(json_body_file)
+      remote_api POST "/api/v1/tasks/$1/undo" "$body_file" >"$resp_file"
+      local reverted
+      reverted=$(python3 -c 'import json,sys; print(", ".join(json.load(open(sys.argv[1])).get("reverted", [])))' "$resp_file")
+      printf 'Undid last edit of task #%s: %s\n' "$1" "$reverted"
+      ;;
+    trash)
+      if [ "$#" -ge 1 ] && [ "$1" = "purge" ]; then
+        shift
+        local days=30 all=0
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --days) [ "$#" -ge 2 ] || die "--days requires a value."; days=$2; shift 2 ;;
+            --all) all=1; shift ;;
+            --help|-h) usage; exit 0 ;;
+            *) die "unknown trash purge option: $1" ;;
+          esac
+        done
+        if [ "$all" -eq 1 ]; then
+          body_file=$(json_body_file all "json:true")
+        else
+          [[ "$days" =~ ^[0-9]+$ ]] || die "--days must be a non-negative integer."
+          body_file=$(json_body_file days "json:$days")
+        fi
+        remote_api POST "/api/v1/trash/purge" "$body_file" >"$resp_file"
+        local purged
+        purged=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("purged", 0))' "$resp_file")
+        printf 'Purged %s trashed task(s)\n' "$purged"
+      elif [ "$#" -eq 0 ]; then
+        remote_api GET "/api/v1/trash" >"$resp_file"
+        remote_render trash "$resp_file"
+      else
+        die "unknown trash command: $1 (see 'cxq trash purge')"
+      fi
       ;;
     board)
       remote_api GET "/api/v1/board" >"$resp_file"
@@ -4971,7 +5119,7 @@ main() {
   # Remote mode: the server owns the queue; route read/write commands over HTTP.
   if [ -n "${CXQ_REMOTE_URL:-}" ]; then
     case "$command" in
-      add|list|ls|next|show|claim|claim-next|block|deps|unblock|note|prompt|review|done|reopen|release|edit|delete|remove|restore|undo|trash|board|stats|activity|export|export-md|stale|finding|due)
+      add|list|ls|next|show|claim|claim-next|block|deps|unblock|note|prompt|review|done|reopen|release|edit|delete|remove|restore|undo|trash|board|stats|activity|export|export-md|stale|finding|due|digest)
         shift
         cmd_remote_dispatch "$command" "$@"
         return $?
@@ -5025,6 +5173,10 @@ main() {
     due)
       shift
       cmd_due "$@"
+      ;;
+    digest)
+      shift
+      cmd_digest "$@"
       ;;
     next)
       shift
