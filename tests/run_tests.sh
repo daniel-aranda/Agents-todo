@@ -271,7 +271,7 @@ test_install_rejects_non_git_directory() {
   set -e
   [ "$status" -ne 0 ] || fail "cxq install should fail outside Git"
   assert_contains "$output" "root of a Git project"
-  assert_not_exists "$dir/.codex"
+  assert_not_exists "$dir/.cxq"
   pass "cxq install does nothing outside Git projects"
 }
 
@@ -286,8 +286,8 @@ test_install_rejects_git_subdirectory() {
   set -e
   [ "$status" -ne 0 ] || fail "cxq install should fail from Git subdirectories"
   assert_contains "$output" "root of a Git project"
-  assert_not_exists "$repo/src/.codex"
-  assert_not_exists "$repo/.codex"
+  assert_not_exists "$repo/src/.cxq"
+  assert_not_exists "$repo/.cxq"
   pass "cxq install only runs from the Git root"
 }
 
@@ -297,16 +297,16 @@ test_project_install_creates_files() {
   run_git_init "$repo"
   output=$(cd "$repo" && "$CXQ" install)
   assert_contains "$output" "cxq installed for project"
-  assert_dir "$repo/.codex"
-  assert_file "$repo/.codex/tasks.db"
-  assert_file "$repo/.codex/tasks.schema.sql"
-  assert_file "$repo/.codex/prompts/task.md"
+  assert_dir "$repo/.cxq"
+  assert_file "$repo/.cxq/tasks.db"
+  assert_file "$repo/.cxq/tasks.schema.sql"
+  assert_file "$repo/.cxq/prompts/task.md"
   assert_file "$repo/.gitignore"
   assert_file "$repo/AGENTS.md"
-  grep -qxF ".codex/tasks.db" "$repo/.gitignore" || fail "missing tasks.db gitignore entry"
-  grep -qxF ".codex/tasks.db-*" "$repo/.gitignore" || fail "missing WAL gitignore entry"
+  grep -qxF ".cxq/tasks.db" "$repo/.gitignore" || fail "missing tasks.db gitignore entry"
+  grep -qxF ".cxq/tasks.db-*" "$repo/.gitignore" || fail "missing WAL gitignore entry"
   grep -qxF "## Local task queue" "$repo/AGENTS.md" || fail "missing AGENTS.md queue contract"
-  grep -qF "cxq claim-next --agent codex --lease 2h --format prompt" "$repo/AGENTS.md" || fail "missing claim-next AGENTS.md guidance"
+  grep -qF "cxq claim-next --lease 2h --format prompt" "$repo/AGENTS.md" || fail "missing claim-next AGENTS.md guidance"
   pass "cxq install creates project queue files"
 }
 
@@ -318,14 +318,14 @@ test_project_install_preserves_custom_files() {
 
   schema="-- custom schema marker --"
   prompt="custom prompt marker"
-  printf '%s\n' "$schema" >"$repo/.codex/tasks.schema.sql"
-  printf '%s\n' "$prompt" >"$repo/.codex/prompts/task.md"
+  printf '%s\n' "$schema" >"$repo/.cxq/tasks.schema.sql"
+  printf '%s\n' "$prompt" >"$repo/.cxq/prompts/task.md"
 
   output=$(cd "$repo" && "$CXQ" install)
-  assert_contains "$output" "Left unchanged: .codex/tasks.schema.sql"
-  assert_contains "$output" "Left unchanged: .codex/prompts/task.md"
-  grep -qxF -e "$schema" "$repo/.codex/tasks.schema.sql" || fail "custom schema was overwritten"
-  grep -qxF -e "$prompt" "$repo/.codex/prompts/task.md" || fail "custom prompt was overwritten"
+  assert_contains "$output" "Left unchanged: .cxq/tasks.schema.sql"
+  assert_contains "$output" "Left unchanged: .cxq/prompts/task.md"
+  grep -qxF -e "$schema" "$repo/.cxq/tasks.schema.sql" || fail "custom schema was overwritten"
+  grep -qxF -e "$prompt" "$repo/.cxq/prompts/task.md" || fail "custom prompt was overwritten"
   pass "cxq install preserves customized schema and prompt files"
 }
 
@@ -356,10 +356,10 @@ test_queue_lifecycle() {
   assert_contains "$prompt" "src/auth"
   assert_contains "$prompt" "npm test -- auth"
 
-  (cd "$repo" && "$CXQ" claim "$id" --agent codex --lease 30m >/dev/null)
+  (cd "$repo" && "$CXQ" claim "$id" --agent tester --lease 30m >/dev/null)
   list=$(cd "$repo" && "$CXQ" list)
   assert_contains "$list" "claimed"
-  assert_contains "$list" "codex"
+  assert_contains "$list" "tester"
 
   (cd "$repo" && "$CXQ" note "$id" "Race found in refresh path" >/dev/null)
   prompt=$(cd "$repo" && "$CXQ" prompt "$id")
@@ -368,16 +368,16 @@ test_queue_lifecycle() {
   review_list=$(cd "$repo" && "$CXQ" list --status review)
   assert_contains "$review_list" "review" "review status should be visible"
   assert_contains "$review_list" "Fix auth refresh"
-  claim_fields=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")
+  claim_fields=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")
   [ "$claim_fields" = "1" ] || fail "review should clear current claim fields"
 
   (cd "$repo" && "$CXQ" done "$id" --summary "Accepted" >/dev/null)
   done_list=$(cd "$repo" && "$CXQ" list --all)
   assert_contains "$done_list" "done"
-  claim_fields=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")
+  claim_fields=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")
   [ "$claim_fields" = "1" ] || fail "done should clear current claim fields"
 
-  events=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $id;")
+  events=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $id;")
   [ "$events" -ge 5 ] || fail "expected at least five task events, got $events"
   pass "task lifecycle commands work"
 }
@@ -397,7 +397,7 @@ test_show_renders_task_context() {
     --acceptance "- render fields" \
     --verify "make test")
   id=${add_output##*#}
-  (cd "$repo" && "$CXQ" claim "$id" --agent codex --lease 30m >/dev/null)
+  (cd "$repo" && "$CXQ" claim "$id" --agent tester --lease 30m >/dev/null)
   (cd "$repo" && "$CXQ" note "$id" "Important note" >/dev/null)
   (cd "$repo" && "$CXQ" review "$id" --summary "Ready for human review" >/dev/null)
 
@@ -431,7 +431,7 @@ test_claim_next_claims_ready_task() {
 
   claimed=$(cd "$repo" && "$CXQ" claim-next --agent worker-a --lease 30m --format id)
   [ "$claimed" = "$second" ] || fail "claim-next should pick highest priority task, expected $second got $claimed"
-  claimed_by=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT claimed_by FROM tasks WHERE id = $claimed;")
+  claimed_by=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT claimed_by FROM tasks WHERE id = $claimed;")
   [ "$claimed_by" = "worker-a" ] || fail "claim-next should set claimed_by"
   pass "claim-next claims the highest-priority ready task"
 }
@@ -465,11 +465,11 @@ test_claim_next_reclaims_expired_task() {
   add_output=$(cd "$repo" && "$CXQ" add "Expired claim")
   id=${add_output##*#}
   (cd "$repo" && "$CXQ" claim "$id" --agent old-agent --lease 30m >/dev/null)
-  sqlite3 -batch "$repo/.codex/tasks.db" "UPDATE tasks SET lease_until = '2000-01-01T00:00:00.000Z' WHERE id = $id;"
+  sqlite3 -batch "$repo/.cxq/tasks.db" "UPDATE tasks SET lease_until = '2000-01-01T00:00:00.000Z' WHERE id = $id;"
 
   claimed=$(cd "$repo" && "$CXQ" claim-next --agent new-agent --lease 30m --format id)
   [ "$claimed" = "$id" ] || fail "claim-next should reclaim expired task $id, got $claimed"
-  claimed_by=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT claimed_by FROM tasks WHERE id = $id;")
+  claimed_by=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT claimed_by FROM tasks WHERE id = $id;")
   [ "$claimed_by" = "new-agent" ] || fail "claim-next should replace expired claim owner"
   pass "claim-next reclaims expired claimed tasks"
 }
@@ -500,14 +500,14 @@ test_claim_next_prompt_lifecycle() {
   add_output=$(cd "$repo" && "$CXQ" add "Prompt lifecycle" --body "Prompt body" --tag agent)
   id=${add_output##*#}
 
-  prompt=$(cd "$repo" && "$CXQ" claim-next --agent codex --lease 2h --format prompt)
+  prompt=$(cd "$repo" && "$CXQ" claim-next --agent tester --lease 2h --format prompt)
   assert_contains "$prompt" "Prompt lifecycle"
   assert_contains "$prompt" "Prompt body"
   assert_contains "$prompt" "agent"
   assert_contains "$prompt" "Move implementation work to \`review\`, not \`done\`"
   (cd "$repo" && "$CXQ" note "$id" "Implemented prompt lifecycle" >/dev/null)
   (cd "$repo" && "$CXQ" review "$id" --summary "Ready" >/dev/null)
-  review_status=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $id;")
+  review_status=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $id;")
   [ "$review_status" = "review" ] || fail "claim-next prompt lifecycle should end in review"
   pass "claim-next prompt lifecycle works"
 }
@@ -602,12 +602,12 @@ test_release_clears_claim_fields() {
   (cd "$repo" && "$CXQ" install >/dev/null)
   add_output=$(cd "$repo" && "$CXQ" add "Release me")
   id=${add_output##*#}
-  (cd "$repo" && "$CXQ" claim "$id" --agent codex --lease 30m >/dev/null)
+  (cd "$repo" && "$CXQ" claim "$id" --agent tester --lease 30m >/dev/null)
   (cd "$repo" && "$CXQ" release "$id" >/dev/null)
 
-  status=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $id;")
+  status=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $id;")
   [ "$status" = "ready" ] || fail "release should return task to ready"
-  count=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")
+  count=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")
   [ "$count" = "1" ] || fail "release should clear all current claim fields"
   pass "release clears current claim fields"
 }
@@ -658,7 +658,7 @@ test_doctor_reports_state_and_is_read_only() {
   assert_contains "$output" "sqlite3: ok"
   assert_contains "$output" "update_required: 1"
   assert_contains "$output" "repo_queue_installed: no"
-  assert_not_exists "$repo/.codex"
+  assert_not_exists "$repo/.cxq"
 
   (cd "$repo" && CXQ_NO_UPDATE_CHECK=1 "$CXQ" install >/dev/null)
   output=$(cd "$repo" && "$CXQ" doctor)
@@ -738,13 +738,13 @@ test_interactive_update_prompt_yes() {
   repo="$TEST_DIR/update-interactive-yes"
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
-  rm "$repo/.codex/prompts/task.md"
+  rm "$repo/.cxq/prompts/task.md"
 
   output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=y "$CXQ" add "After yes" 2>&1)
   assert_contains "$output" "Run update now? [Y/n]"
   assert_contains "$output" "Created task #"
-  assert_file "$repo/.codex/prompts/task.md"
-  count=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'After yes';")
+  assert_file "$repo/.cxq/prompts/task.md"
+  count=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'After yes';")
   [ "$count" = "1" ] || fail "interactive yes should rerun original command"
   pass "interactive update prompt yes path updates and reruns"
 }
@@ -754,7 +754,7 @@ test_interactive_update_prompt_no() {
   repo="$TEST_DIR/update-interactive-no"
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
-  rm "$repo/.codex/prompts/task.md"
+  rm "$repo/.cxq/prompts/task.md"
 
   set +e
   output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=n "$CXQ" add "After no" 2>&1)
@@ -762,7 +762,7 @@ test_interactive_update_prompt_no() {
   set -e
   [ "$status" -ne 0 ] || fail "interactive no should fail"
   assert_contains "$output" "Command not run."
-  count=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'After no';")
+  count=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'After no';")
   [ "$count" = "0" ] || fail "interactive no should not run original command"
   pass "interactive update prompt no path blocks command"
 }
@@ -807,12 +807,12 @@ test_assume_yes_attempts_update() {
   repo="$TEST_DIR/update-assume-yes"
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
-  rm "$repo/.codex/prompts/task.md"
+  rm "$repo/.cxq/prompts/task.md"
 
   output=$(cd "$repo" && CXQ_ASSUME_YES=1 "$CXQ" add "Assume yes" 2>&1)
   assert_contains "$output" "Created task #"
-  assert_file "$repo/.codex/prompts/task.md"
-  count=$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'Assume yes';")
+  assert_file "$repo/.cxq/prompts/task.md"
+  count=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'Assume yes';")
   [ "$count" = "1" ] || fail "CXQ_ASSUME_YES should update and rerun original command"
   pass "CXQ_ASSUME_YES attempts automatic update"
 }
@@ -845,7 +845,7 @@ test_plain_update_requires_yes_when_modifying_noninteractive() {
   repo="$TEST_DIR/update-plain-needs-yes"
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
-  rm "$repo/.codex/prompts/task.md"
+  rm "$repo/.cxq/prompts/task.md"
 
   set +e
   output=$(cd "$repo" && "$CXQ" update 2>&1)
@@ -853,7 +853,7 @@ test_plain_update_requires_yes_when_modifying_noninteractive() {
   set -e
   [ "$status" -ne 0 ] || fail "plain non-interactive update should require --yes before modifying files"
   assert_contains "$output" "Run: cxq update --yes"
-  assert_not_exists "$repo/.codex/prompts/task.md"
+  assert_not_exists "$repo/.cxq/prompts/task.md"
   pass "plain non-interactive update requires --yes when modifying files"
 }
 
@@ -862,12 +862,12 @@ test_plain_update_yes_repairs_repo_and_clears_state() {
   repo="$TEST_DIR/update-plain-yes"
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
-  rm "$repo/.codex/prompts/task.md"
+  rm "$repo/.cxq/prompts/task.md"
 
   output=$(cd "$repo" && "$CXQ" update --yes)
-  assert_contains "$output" "Created: .codex/prompts/task.md"
+  assert_contains "$output" "Created: .cxq/prompts/task.md"
   assert_contains "$output" "Repo setup is up to date."
-  assert_file "$repo/.codex/prompts/task.md"
+  assert_file "$repo/.cxq/prompts/task.md"
   [ "$(state_get "update_required")" = "0" ] || fail "plain update --yes should clear update_required"
   pass "plain update --yes repairs repo setup and clears state"
 }
@@ -930,14 +930,14 @@ test_update_all_yes_repairs_repo_setup() {
   repo="$TEST_DIR/update-all-repo"
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
-  rm "$repo/.codex/prompts/task.md"
+  rm "$repo/.cxq/prompts/task.md"
   state_set "update_required" "1"
   state_set "update_required_kind" "repo"
   state_set "update_required_reason" "missing prompt"
 
   output=$(cd "$repo" && "$CXQ" update --all --yes)
-  assert_contains "$output" "Created: .codex/prompts/task.md"
-  assert_file "$repo/.codex/prompts/task.md"
+  assert_contains "$output" "Created: .cxq/prompts/task.md"
+  assert_file "$repo/.cxq/prompts/task.md"
   [ "$(state_get "update_required")" = "0" ] || fail "update --all --yes should clear repo update requirement"
   pass "update --all --yes repairs repo setup"
 }
@@ -1264,12 +1264,12 @@ test_doctor_reports_repo_database() {
   assert_contains "$output" "repo_db: none"
   assert_contains "$output" "repo_schema_version: none"
   assert_contains "$output" "repo_db_integrity: none"
-  assert_not_exists "$repo/.codex"
+  assert_not_exists "$repo/.cxq"
 
   (cd "$repo" && "$CXQ" install >/dev/null)
   (cd "$repo" && "$CXQ" add "Doctor sample" >/dev/null)
   output=$(cd "$repo" && "$CXQ" doctor)
-  assert_contains "$output" "/doctor-db/.codex/tasks.db"
+  assert_contains "$output" "/doctor-db/.cxq/tasks.db"
   assert_contains "$output" "repo_schema_version: 4 (expected 4)"
   assert_contains "$output" "repo_task_total: 1"
   assert_contains "$output" "repo_task_counts: ready=1"
@@ -1306,7 +1306,7 @@ test_status_transitions_table_and_release() {
   (cd "$repo" && "$CXQ" reopen "$id" --to blocked --reason "waiting on product" >/dev/null)
   output=$(cd "$repo" && "$CXQ" release "$id")
   assert_contains "$output" "Released task #$id"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $id;")" = "ready" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $id;")" = "ready" ] ||
     fail "release from blocked should return the task to ready"
   pass "status transitions are documented and release accepts blocked tasks"
 }
@@ -1318,7 +1318,7 @@ test_reopen_returns_tasks_to_ready() {
   (cd "$repo" && "$CXQ" install >/dev/null)
 
   id=$(cd "$repo" && "$CXQ" add "Reopen sample" | sed 's/.*#//')
-  (cd "$repo" && "$CXQ" claim "$id" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" claim "$id" --agent tester --lease 1h >/dev/null)
   (cd "$repo" && "$CXQ" note "$id" "Found a race in the refresh path" >/dev/null)
   (cd "$repo" && "$CXQ" review "$id" --summary "Partially implemented" >/dev/null)
 
@@ -1338,9 +1338,9 @@ test_reopen_returns_tasks_to_ready() {
 
   output=$(cd "$repo" && "$CXQ" reopen "$id" --reason "acceptance criteria 3 is missing")
   assert_contains "$output" "Reopened task #$id: review -> ready"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $id;")" = "ready" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $id;")" = "ready" ] ||
     fail "reopen should move the task back to ready"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")" = "1" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")" = "1" ] ||
     fail "reopen should clear claim fields"
 
   summary=$(cd "$repo" && "$CXQ" show "$id")
@@ -1361,7 +1361,7 @@ test_followup_links_residual_work() {
   (cd "$repo" && "$CXQ" install >/dev/null)
 
   parent=$(cd "$repo" && "$CXQ" add "Original work" --priority 70 --files "src/a,src/b" --tag auth --verify "make check" | sed 's/.*#//')
-  (cd "$repo" && "$CXQ" claim "$parent" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" claim "$parent" --agent tester --lease 1h >/dev/null)
   (cd "$repo" && "$CXQ" review "$parent" --summary "Main path done" >/dev/null)
 
   output=$(cd "$repo" && "$CXQ" followup "$parent" "Handle the error branch")
@@ -1387,7 +1387,7 @@ test_followup_links_residual_work() {
   output=$(cd "$repo" && "$CXQ" split "$parent" "Close it out" --close --priority 40)
   assert_contains "$output" "Created follow-up task #"
   assert_contains "$output" "Closed task #$parent with follow-up #"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $parent;")" = "done" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $parent;")" = "done" ] ||
     fail "--close should mark the original done"
   output=$(cd "$repo" && "$CXQ" show "$parent")
   assert_contains "$output" "Closed with follow-up #" "closing summary should mention the follow-up"
@@ -1402,7 +1402,7 @@ test_findings_lifecycle() {
 
   id=$(cd "$repo" && "$CXQ" add "Reviewed work" | sed 's/.*#//')
   followup=$(cd "$repo" && "$CXQ" add "Fix the finding later" | sed 's/.*#//')
-  (cd "$repo" && "$CXQ" claim "$id" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" claim "$id" --agent tester --lease 1h >/dev/null)
   (cd "$repo" && "$CXQ" review "$id" --summary "Ready for review" >/dev/null)
 
   set +e
@@ -1439,7 +1439,7 @@ test_findings_lifecycle() {
 
   output=$(cd "$repo" && "$CXQ" show "$id")
   assert_contains "$output" "[high/resolved] Retry loop is unbounded"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
     fail "findings require schema version 4"
   pass "findings can be added, listed, rendered, and resolved"
 }
@@ -1457,7 +1457,7 @@ test_operational_views() {
 
   (cd "$repo" && "$CXQ" reopen "$blocked" --to blocked --reason "needs a decision" >/dev/null)
   for stale_id in "$reviewed" "$clean"; do
-    (cd "$repo" && "$CXQ" claim "$stale_id" --agent codex --lease 1h >/dev/null)
+    (cd "$repo" && "$CXQ" claim "$stale_id" --agent tester --lease 1h >/dev/null)
     (cd "$repo" && "$CXQ" review "$stale_id" --summary "Please review" >/dev/null)
   done
   (cd "$repo" && "$CXQ" finding add "$reviewed" --severity medium --note "Edge case is untested" >/dev/null)
@@ -1480,7 +1480,7 @@ test_operational_views() {
   output=$(cd "$repo" && "$CXQ" review-stale)
   assert_not_contains "$output" "Review with findings" "fresh reviews are not stale after 24h"
 
-  sqlite3 -batch "$repo/.codex/tasks.db" "DROP TRIGGER IF EXISTS trg_tasks_updated_at; UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-48 hours') WHERE id = $reviewed;"
+  sqlite3 -batch "$repo/.cxq/tasks.db" "DROP TRIGGER IF EXISTS trg_tasks_updated_at; UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-48 hours') WHERE id = $reviewed;"
 
   output=$(cd "$repo" && "$CXQ" review-stale)
   assert_contains "$output" "Review with findings"
@@ -1516,7 +1516,7 @@ test_done_warns_about_unfinished_work() {
   assert_contains "$output" "may not be finished"
   assert_contains "$output" "the summary still mentions pending work"
   assert_contains "$output" "cxq done $pending --force"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $pending;")" != "done" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $pending;")" != "done" ] ||
     fail "a warned task must not be closed without --force"
 
   output=$(cd "$repo" && "$CXQ" done "$pending" --summary "Main flow works, docs are still pending" --force)
@@ -1537,7 +1537,7 @@ test_done_warns_about_unfinished_work() {
   [ "$status" -ne 0 ] || fail "answering no should abort an interactive close"
   assert_contains "$output" "Mark task #$withfinding done anyway? [y/N]"
   assert_contains "$output" "was not closed"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $withfinding;")" != "done" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $withfinding;")" != "done" ] ||
     fail "answering no must leave the task open"
 
   output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=y "$CXQ" done "$withfinding" --summary "Shipped" 2>&1)
@@ -1545,7 +1545,7 @@ test_done_warns_about_unfinished_work() {
 
   output=$(cd "$repo" && "$CXQ" done "$clean" --summary "Implemented and verified")
   assert_contains "$output" "Marked task #$clean done"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT status FROM tasks WHERE id = $clean;")" = "done" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $clean;")" = "done" ] ||
     fail "a clean close must never be blocked"
   pass "done warns before closing tasks with unfinished work"
 }
@@ -1579,9 +1579,9 @@ test_concurrent_commands_do_not_lock() {
   assert_not_contains "$combined" "database is locked" "concurrent commands must not fail on SQLite locks"
   [ "$status" -eq 0 ] || fail "concurrent cxq commands should all succeed. Output: $combined"
 
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title LIKE 'Parallel task %';")" = "6" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title LIKE 'Parallel task %';")" = "6" ] ||
     fail "every concurrent add should be recorded"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $id AND event_type = 'note';")" = "6" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $id AND event_type = 'note';")" = "6" ] ||
     fail "every concurrent note should be recorded"
   pass "concurrent reads and writes do not hit database locks"
 }
@@ -1608,9 +1608,9 @@ test_edit_updates_fields_and_logs_diff() {
   assert_contains "$output" "feature/x"
   assert_contains "$output" "## Edit history"
   assert_contains "$output" "title: Original title -> New title"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $id AND event_type = 'edited';")" = "1" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $id AND event_type = 'edited';")" = "1" ] ||
     fail "one edit must log exactly one edited event"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT due_date FROM tasks WHERE id = $id;")" = "2026-12-01" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT due_date FROM tasks WHERE id = $id;")" = "2026-12-01" ] ||
     fail "due_date must be stored"
 
   # files/tags add + remove, and --due-clear
@@ -1673,7 +1673,7 @@ test_edit_rejects_bad_input() {
   assert_contains "$output" "cannot move task $id from ready to done"
 
   # Legal transition out of review requires a reason.
-  (cd "$repo" && "$CXQ" claim "$id" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" claim "$id" --agent tester --lease 1h >/dev/null)
   (cd "$repo" && "$CXQ" review "$id" --summary "done-ish" >/dev/null)
   set +e
   output=$(cd "$repo" && "$CXQ" edit "$id" --status ready 2>&1); status=$?
@@ -1696,7 +1696,7 @@ test_delete_guardrails() {
   ready=$(cd "$repo" && "$CXQ" add "Deletable" | sed 's/.*#//')
   claimed=$(cd "$repo" && "$CXQ" add "Claimed task" | sed 's/.*#//')
   inbox=$(cd "$repo" && "$CXQ" add "Inbox task" --status inbox | sed 's/.*#//')
-  (cd "$repo" && "$CXQ" claim "$claimed" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" claim "$claimed" --agent tester --lease 1h >/dev/null)
   (cd "$repo" && "$CXQ" note "$ready" "a note to cascade" >/dev/null)
   (cd "$repo" && "$CXQ" finding add "$ready" --severity low --note "nit" >/dev/null)
 
@@ -1724,11 +1724,11 @@ test_delete_guardrails() {
 
   output=$(cd "$repo" && "$CXQ" delete "$ready" --force)
   assert_contains "$output" "Deleted task #$ready"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $ready;")" = "0" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $ready;")" = "0" ] ||
     fail "deleted task must be gone"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $ready;")" = "0" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $ready;")" = "0" ] ||
     fail "delete must cascade events"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_findings WHERE task_id = $ready;")" = "0" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_findings WHERE task_id = $ready;")" = "0" ] ||
     fail "delete must cascade findings"
 
   output=$(cd "$repo" && "$CXQ" remove "$claimed" --force)
@@ -1751,7 +1751,7 @@ test_board_stats_activity() {
   a=$(cd "$repo" && "$CXQ" add "Overdue ready" --priority 90 --due 2000-01-01 | sed 's/.*#//')
   b=$(cd "$repo" && "$CXQ" add "Future ready" --priority 80 --due 2999-01-01 | sed 's/.*#//')
   c=$(cd "$repo" && "$CXQ" add "Claimed one" --priority 70 | sed 's/.*#//')
-  (cd "$repo" && "$CXQ" claim "$c" --agent codex --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" claim "$c" --agent tester --lease 1h >/dev/null)
   (cd "$repo" && "$CXQ" block "$b" --by "$a" >/dev/null)
 
   output=$(cd "$repo" && "$CXQ" board)
@@ -1865,11 +1865,11 @@ test_export_and_watch() {
 # Builds a hand-made schema-v3 queue DB (no due_date column, meta = 3).
 build_v3_db() {
   local repo=$1
-  mkdir -p "$repo/.codex/prompts"
-  printf 'x\n' >"$repo/.codex/prompts/task.md"
+  mkdir -p "$repo/.cxq/prompts"
+  printf 'x\n' >"$repo/.cxq/prompts/task.md"
   printf '## Local task queue\n\nUse cxq.\n' >"$repo/AGENTS.md"
-  printf -- "-- old stock v1 schema template\nVALUES ('schema_version', '1');\n" >"$repo/.codex/tasks.schema.sql"
-  sqlite3 -batch "$repo/.codex/tasks.db" "
+  printf -- "-- old stock v1 schema template\nVALUES ('schema_version', '1');\n" >"$repo/.cxq/tasks.schema.sql"
+  sqlite3 -batch "$repo/.cxq/tasks.db" "
 CREATE TABLE tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,body TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'inbox',priority INTEGER NOT NULL DEFAULT 50,repo_path TEXT NOT NULL,branch TEXT,allowed_paths_json TEXT NOT NULL DEFAULT '[]',tags_json TEXT NOT NULL DEFAULT '[]',deps_json TEXT NOT NULL DEFAULT '[]',acceptance TEXT NOT NULL DEFAULT '',verify_command TEXT NOT NULL DEFAULT '',claimed_by TEXT,claimed_at TEXT,lease_until TEXT,result_summary TEXT NOT NULL DEFAULT '',transcript_path TEXT,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE TABLE task_events(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER NOT NULL,event_type TEXT NOT NULL,actor TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',data_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
 CREATE TABLE task_dependencies(task_id INTEGER NOT NULL,blocker_task_id INTEGER NOT NULL,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),PRIMARY KEY(task_id,blocker_task_id));
@@ -1889,13 +1889,13 @@ test_schema_migration_v3_to_v4() {
 
   output=$(cd "$repo" && "$CXQ" migrate)
   assert_contains "$output" "Migrated schema v3 -> v4"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
     fail "migrate must bump schema_version to 4"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'due_date';")" = "1" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'due_date';")" = "1" ] ||
     fail "migrate must add the due_date column"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT title FROM tasks WHERE id = 1;")" = "Legacy task" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT title FROM tasks WHERE id = 1;")" = "Legacy task" ] ||
     fail "migrate must preserve existing tasks"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = 1;")" = "1" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = 1;")" = "1" ] ||
     fail "migrate must preserve events"
   output=$(cd "$repo" && "$CXQ" list)
   assert_contains "$output" "Legacy task"
@@ -1912,9 +1912,49 @@ test_schema_migration_v3_to_v4() {
   build_v3_db "$repo"
   output=$(cd "$repo" && "$CXQ" list 2>/dev/null)
   assert_contains "$output" "Legacy task"
-  [ "$(sqlite3 -batch -noheader "$repo/.codex/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
     fail "opening a v3 queue must auto-migrate it to v4"
   pass "schema v3 -> v4 migration preserves data and auto-migrates on open"
+}
+
+test_legacy_codex_dir_migrates_to_cxq() {
+  local repo output
+  repo="$TEST_DIR/migrate-codex-dir"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  (cd "$repo" && "$CXQ" add "Legacy dir task" --priority 70 >/dev/null)
+  # Simulate a pre-0.4.0 queue: move the whole directory back to .codex/.
+  mv "$repo/.cxq" "$repo/.codex"
+  printf '.codex/tasks.db\n.codex/tasks.db-*\n' >"$repo/.gitignore"
+
+  output=$(cd "$repo" && "$CXQ" list 2>&1)
+  assert_contains "$output" "Legacy dir task"
+  assert_contains "$output" "migrated queue directory .codex -> .cxq"
+  [ -d "$repo/.cxq" ] || fail ".cxq must exist after migration"
+  [ ! -e "$repo/.codex" ] || fail ".codex must be gone after migration"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT title FROM tasks WHERE id = 1;")" = "Legacy dir task" ] ||
+    fail "migration must preserve existing tasks"
+  grep -qxF ".cxq/tasks.db" "$repo/.gitignore" ||
+    fail ".gitignore must point at .cxq after migration"
+  # Second open is a no-op: no second migration notice.
+  output=$(cd "$repo" && "$CXQ" list 2>&1)
+  case "$output" in
+    *migrated*) fail "migration must be idempotent" ;;
+  esac
+
+  # Half-moved queue: template files already in .cxq/, database still in
+  # .codex/. The migration finishes the move instead of refusing.
+  repo="$TEST_DIR/migrate-codex-half"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  (cd "$repo" && "$CXQ" add "Half-moved task" --priority 70 >/dev/null)
+  mkdir "$repo/.codex"
+  mv "$repo/.cxq/tasks.db" "$repo/.codex/tasks.db"
+  output=$(cd "$repo" && "$CXQ" list 2>&1)
+  assert_contains "$output" "Half-moved task"
+  assert_contains "$output" "migrated queue database .codex -> .cxq"
+  [ ! -e "$repo/.codex" ] || fail ".codex must be gone after finishing a half-moved queue"
+  pass "legacy .codex directory migrates to .cxq, preserving tasks"
 }
 
 free_port() {
@@ -1965,7 +2005,7 @@ test_server_smoke_and_remote_mode() {
   assert_contains "$output" "due date must be a valid YYYY-MM-DD date"
 
   output=$(curl -s -H "Authorization: Bearer test-token-xyz" -H "Content-Type: application/json" \
-    -X POST -d '{"agent":"codex","lease":"2h"}' "http://127.0.0.1:$port/api/v1/tasks/1/claim")
+    -X POST -d '{"agent":"tester","lease":"2h"}' "http://127.0.0.1:$port/api/v1/tasks/1/claim")
   assert_contains "$output" '"status": "claimed"'
 
   # Dashboard HTML is served and contains the kanban shell.
@@ -2116,6 +2156,7 @@ test_doctor_reports_remote_mode
 test_serve_requires_token_and_starts
 test_server_smoke_and_remote_mode
 test_schema_migration_v3_to_v4
+test_legacy_codex_dir_migrates_to_cxq
 test_export_and_watch
 test_list_filters_and_formats
 test_board_stats_activity

@@ -1,10 +1,10 @@
 # AGENTS.md
 
-Guidance for Codex and other AI agents working on this repository.
+Guidance for AI agents working on this repository.
 
 ## Project
 
-This repo contains `cxq`, a small CLI for a SQLite task queue for Codex/local coding agents, on macOS and Linux.
+This repo contains `cxq`, a small CLI for a SQLite task queue for coding agents, on macOS and Linux.
 
 The implementation is intentionally boring:
 
@@ -152,7 +152,7 @@ Examples:
 - `test: cover non-destructive repo updates`
 - `chore: bump cxq to 0.1.2`
 
-## Required final response from Codex
+## Required final response from the agent
 
 At the end of every task, report:
 
@@ -219,7 +219,7 @@ This repo is itself a good test subject for `cxq`.
 For local task work, prefer:
 
 ~~~sh
-cxq claim-next --agent codex --lease 2h --format prompt
+cxq claim-next --lease 2h --format prompt
 ~~~
 
 When working on a claimed task:
@@ -271,14 +271,14 @@ Rules:
 
 These files may be user-customized and must not be silently overwritten:
 
-- `.codex/tasks.schema.sql`
-- `.codex/prompts/task.md`
+- `.cxq/tasks.schema.sql`
+- `.cxq/prompts/task.md`
 - `AGENTS.md`
 
 If a newer default differs from an existing customized file, write a `.new` file instead:
 
-- `.codex/tasks.schema.sql.new`
-- `.codex/prompts/task.md.new`
+- `.cxq/tasks.schema.sql.new`
+- `.cxq/prompts/task.md.new`
 - `AGENTS.md.cxq.new`
 
 ## Database rules
@@ -289,7 +289,7 @@ Use SQLite carefully.
 - Use helper functions for SQL quoting.
 - Keep schema migrations explicit.
 - Preserve user data.
-- Do not delete `.codex/tasks.db` unless explicitly instructed.
+- Do not delete `.cxq/tasks.db` unless explicitly instructed.
 - Store schema version with `PRAGMA user_version` when applicable.
 - Store task dependencies in `task_dependencies`; do not rely on `deps_json` for claimability.
 - Store review findings in `task_findings`; do not encode them in `result_summary`.
@@ -362,13 +362,13 @@ Before finishing, verify:
 - Suggested commit message is provided.
 ## Local task queue
 
-This repo uses a local Codex task queue.
+This repo uses a local agent task queue.
 
-Use `cxq` to read and update tasks. Do not edit `.codex/tasks.db` directly.
+Use `cxq` to read and update tasks. Do not edit `.cxq/tasks.db` directly.
 
 Before starting queued work:
 
-1. Claim exactly one task with `cxq claim-next --agent codex --lease 2h --format prompt`.
+1. Claim exactly one task with `cxq claim-next --lease 2h --format prompt`.
 2. Work only on the claimed task.
 3. Respect `allowed_paths` unless the task clearly requires more scope.
 4. Use `cxq deps <id>` to inspect blockers when dependency context matters.

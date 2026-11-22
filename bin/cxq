@@ -14,7 +14,7 @@ die() {
 
 usage() {
   cat <<'EOF'
-cxq - local Codex task queue
+cxq - agent task queue
 
 Usage:
   cxq -v | --version
@@ -80,7 +80,7 @@ Examples:
   cxq block 42 --by 17
   cxq deps 42
   cxq next --format md
-  cxq claim-next --agent codex --lease 2h --format prompt
+  cxq claim-next --lease 2h --format prompt
 EOF
 }
 
@@ -210,10 +210,53 @@ install_root_or_die() {
   printf '%s' "$root"
 }
 
+# Queues created before v0.4.0 lived in .codex/. Move the queue to .cxq/
+# on first use, preserving every task and event. Idempotent: a repo with
+# only .cxq/ (or neither) is untouched. Only a genuine conflict — a
+# database in BOTH directories, which might hold different tasks — is
+# left alone with a warning; .cxq/ wins then. A half-moved queue (for
+# example template files already in .cxq/ but the database still in
+# .codex/) is finished by moving the missing files over.
+migrate_legacy_queue_dir() {
+  local root=$1 legacy new tmp f
+  legacy="$root/.codex"
+  new="$root/.cxq"
+  if [ -d "$legacy" ] && [ ! -e "$new" ]; then
+    mv "$legacy" "$new" || die "could not migrate $legacy to $new"
+    migrate_gitignore_legacy "$root"
+    printf 'cxq: migrated queue directory .codex -> .cxq\n' >&2
+  elif [ -d "$legacy" ] && [ -e "$new" ]; then
+    if [ -f "$legacy/tasks.db" ] && [ ! -f "$new/tasks.db" ]; then
+      mv "$legacy/tasks.db" "$new/tasks.db" || die "could not migrate $legacy/tasks.db to $new/tasks.db"
+      for f in tasks.db-wal tasks.db-shm tasks.schema.sql prompts/task.md; do
+        if [ -f "$legacy/$f" ] && [ ! -f "$new/$f" ]; then
+          mkdir -p "$(dirname "$new/$f")"
+          mv "$legacy/$f" "$new/$f" || die "could not migrate $legacy/$f"
+        fi
+      done
+      rmdir "$legacy/prompts" 2>/dev/null || true
+      rmdir "$legacy" 2>/dev/null || true
+      migrate_gitignore_legacy "$root"
+      printf 'cxq: migrated queue database .codex -> .cxq\n' >&2
+    else
+      printf 'cxq: warning: both .codex and .cxq exist; using .cxq, stale .codex left untouched\n' >&2
+    fi
+  fi
+}
+
+migrate_gitignore_legacy() {
+  local root=$1 tmp
+  if [ -f "$root/.gitignore" ]; then
+    tmp="$root/.gitignore.tmp.$$"
+    sed 's|^\.codex/|.cxq/|' "$root/.gitignore" >"$tmp" && mv "$tmp" "$root/.gitignore"
+  fi
+}
+
 db_path_or_die() {
   local root db
   root=$(project_root_or_die)
-  db="$root/.codex/tasks.db"
+  migrate_legacy_queue_dir "$root"
+  db="$root/.cxq/tasks.db"
   [ -f "$db" ] || die "cxq is not installed in this project. Run 'cxq install' at the Git root."
   migrate_db_if_needed "$db"
   printf '%s' "$db"
@@ -370,13 +413,13 @@ agents_contract() {
 
 ## Local task queue
 
-This repo uses a local Codex task queue.
+This repo uses a local agent task queue.
 
-Use `cxq` to read and update tasks. Do not edit `.codex/tasks.db` directly.
+Use `cxq` to read and update tasks. Do not edit `.cxq/tasks.db` directly.
 
 Before starting queued work:
 
-1. Claim exactly one task with `cxq claim-next --agent codex --lease 2h --format prompt`.
+1. Claim exactly one task with `cxq claim-next --lease 2h --format prompt`.
 2. Work only on the claimed task.
 3. Respect `allowed_paths` unless the task clearly requires more scope.
 4. Run the task's `verify_command` when present.
@@ -794,14 +837,14 @@ log_event() {
 append_gitignore() {
   local file=$1
   touch "$file"
-  if ! grep -qxF ".codex/tasks.db" "$file"; then
+  if ! grep -qxF ".cxq/tasks.db" "$file"; then
     {
       printf '\n# cxq local queue\n'
-      printf '.codex/tasks.db\n'
-      printf '.codex/tasks.db-*\n'
+      printf '.cxq/tasks.db\n'
+      printf '.cxq/tasks.db-*\n'
     } >>"$file"
-  elif ! grep -qxF ".codex/tasks.db-*" "$file"; then
-    printf '.codex/tasks.db-*\n' >>"$file"
+  elif ! grep -qxF ".cxq/tasks.db-*" "$file"; then
+    printf '.cxq/tasks.db-*\n' >>"$file"
   fi
 }
 
@@ -829,16 +872,17 @@ write_file_if_missing() {
 
 setup_project_queue() {
   local root=$1
-  local codex_dir schema_file prompt_dir prompt_file db
-  codex_dir="$root/.codex"
-  schema_file="$codex_dir/tasks.schema.sql"
-  prompt_dir="$codex_dir/prompts"
+  local queue_dir schema_file prompt_dir prompt_file db
+  migrate_legacy_queue_dir "$root"
+  queue_dir="$root/.cxq"
+  schema_file="$queue_dir/tasks.schema.sql"
+  prompt_dir="$queue_dir/prompts"
   prompt_file="$prompt_dir/task.md"
-  db="$codex_dir/tasks.db"
+  db="$queue_dir/tasks.db"
 
   mkdir -p "$prompt_dir"
-  write_file_if_missing "$schema_file" ".codex/tasks.schema.sql" schema_sql
-  write_file_if_missing "$prompt_file" ".codex/prompts/task.md" prompt_template
+  write_file_if_missing "$schema_file" ".cxq/tasks.schema.sql" schema_sql
+  write_file_if_missing "$prompt_file" ".cxq/prompts/task.md" prompt_template
   sqlite_run "$db" "$(schema_sql)" >/dev/null
   append_gitignore "$root/.gitignore"
   append_agents_contract "$root/AGENTS.md"
@@ -866,11 +910,12 @@ repo_update_reason() {
     root=$(physical_path "$root")
   fi
 
-  db="$root/.codex/tasks.db"
+  migrate_legacy_queue_dir "$root"
+  db="$root/.cxq/tasks.db"
 
-  [ -f "$db" ] || reasons="${reasons}${reasons:+; }missing .codex/tasks.db"
-  [ -f "$root/.codex/tasks.schema.sql" ] || reasons="${reasons}${reasons:+; }missing .codex/tasks.schema.sql"
-  [ -f "$root/.codex/prompts/task.md" ] || reasons="${reasons}${reasons:+; }missing .codex/prompts/task.md"
+  [ -f "$db" ] || reasons="${reasons}${reasons:+; }missing .cxq/tasks.db"
+  [ -f "$root/.cxq/tasks.schema.sql" ] || reasons="${reasons}${reasons:+; }missing .cxq/tasks.schema.sql"
+  [ -f "$root/.cxq/prompts/task.md" ] || reasons="${reasons}${reasons:+; }missing .cxq/prompts/task.md"
   if [ ! -f "$root/AGENTS.md" ] || ! grep -qxF "## Local task queue" "$root/AGENTS.md"; then
     reasons="${reasons}${reasons:+; }missing AGENTS.md cxq block"
   fi
@@ -1772,7 +1817,7 @@ cmd_claim() {
   require_sqlite3
   [ "$#" -ge 1 ] || die "task id is required."
 
-  local id=$1 agent="codex" lease="2h"
+  local id=$1 agent="agent" lease="2h"
   require_task_id "$id"
   shift
 
@@ -1815,7 +1860,7 @@ cmd_claim() {
 cmd_claim_next() {
   require_sqlite3
 
-  local agent="codex" lease="2h" format="id"
+  local agent="agent" lease="2h" format="id"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --agent)
@@ -2391,19 +2436,19 @@ cmd_migrate() {
   before=$(db_schema_version "$db")
   migrate_db "$db"
   after=$(db_schema_version "$db")
-  schema_file="$root/.codex/tasks.schema.sql"
+  schema_file="$root/.cxq/tasks.schema.sql"
   new_schema=$(schema_sql)
   if [ ! -f "$schema_file" ]; then
     printf '%s' "$new_schema" >"$schema_file"
-    printf 'Created: .codex/tasks.schema.sql (schema v%s)\n' "$after"
+    printf 'Created: .cxq/tasks.schema.sql (schema v%s)\n' "$after"
   elif grep -q "schema_version', '1'" "$schema_file" || grep -q "schema_version', '3'" "$schema_file"; then
     # Old stock template (v1 file shipped with the repo, or a v3-era file):
     # not a user customization, safe to refresh in place.
     printf '%s' "$new_schema" >"$schema_file"
-    printf 'Updated: .codex/tasks.schema.sql to schema v%s\n' "$after"
+    printf 'Updated: .cxq/tasks.schema.sql to schema v%s\n' "$after"
   elif ! cmp -s <(printf '%s' "$new_schema") "$schema_file"; then
     printf '%s' "$new_schema" >"$schema_file.new"
-    printf 'Left customized schema file unchanged; new template written to .codex/tasks.schema.sql.new\n'
+    printf 'Left customized schema file unchanged; new template written to .cxq/tasks.schema.sql.new\n'
   fi
   printf 'Migrated schema v%s -> v%s\n' "$before" "$after"
   printf 'Database: %s\n' "$db"
@@ -2797,7 +2842,8 @@ cmd_serve() {
       root=$(git_root 2>/dev/null || true)
       if [ -n "$root" ]; then
         root=$(physical_path "$root")
-        db="$root/.codex/tasks.db"
+        migrate_legacy_queue_dir "$root"
+        db="$root/.cxq/tasks.db"
       else
         db="$PWD/tasks.db"
       fi
@@ -3179,7 +3225,7 @@ cmd_remote_dispatch() {
       ;;
     claim)
       [ "$#" -ge 1 ] || die "task id is required."
-      local id=$1 agent="codex" lease="2h"
+      local id=$1 agent="agent" lease="2h"
       require_task_id "$id"; shift
       while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -3193,7 +3239,7 @@ cmd_remote_dispatch() {
       printf 'Claimed task #%s as %s\n' "$id" "$agent"
       ;;
     claim-next)
-      local agent="codex" lease="2h" format="id"
+      local agent="agent" lease="2h" format="id"
       while [ "$#" -gt 0 ]; do
         case "$1" in
           --agent) agent=$2; shift 2 ;;
@@ -3894,7 +3940,7 @@ cmd_doctor() {
   root=$(physical_path "$root")
   printf 'git_repo: %s\n' "$root"
 
-  if [ -f "$root/.codex/tasks.db" ]; then
+  if [ -f "$root/.cxq/tasks.db" ]; then
     queue_installed="yes"
   else
     queue_installed="no"
@@ -3909,7 +3955,7 @@ cmd_doctor() {
     else
       printf 'repo_update_required: no\n'
     fi
-    doctor_report_repo_db "$root/.codex/tasks.db"
+    doctor_report_repo_db "$root/.cxq/tasks.db"
   else
     printf 'repo_update_required: unknown\n'
     printf 'repo_update_reason: sqlite3 missing\n'
