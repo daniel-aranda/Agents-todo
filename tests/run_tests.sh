@@ -59,7 +59,8 @@ current_uptodate_result() {
   esac
 }
 
-export CXQ_TEST_LATEST_VERSION="$(current_uptodate_tag)"
+CXQ_TEST_LATEST_VERSION="$(current_uptodate_tag)"
+export CXQ_TEST_LATEST_VERSION
 
 cleanup() {
   rm -rf "$TEST_DIR"
@@ -208,6 +209,8 @@ assert_cxq_version() {
 test_installer_and_version() {
   PREFIX="$PREFIX" "$ROOT/install.sh" >/tmp/cxq-install-test.out
   assert_file "$CXQ"
+  assert_file "$PREFIX/lib/cxq/cxq_server.py"
+  assert_file "$PREFIX/lib/cxq/cxq_mcp.py"
   assert_file "$HOME/.cxq/state.db"
   [ "$(state_get "install_bin_path")" = "$CXQ" ] || fail "installer should record install_bin_path"
   [ "$(state_get "install_source_dir")" = "$ROOT" ] || fail "installer should record install_source_dir"
@@ -371,7 +374,7 @@ test_queue_lifecycle() {
   claim_fields=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")
   [ "$claim_fields" = "1" ] || fail "review should clear current claim fields"
 
-  (cd "$repo" && "$CXQ" done "$id" --summary "Accepted" >/dev/null)
+  (cd "$repo" && "$CXQ" "done" "$id" --summary "Accepted" >/dev/null)
   done_list=$(cd "$repo" && "$CXQ" list --all)
   assert_contains "$done_list" "done"
   claim_fields=$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $id AND claimed_by IS NULL AND claimed_at IS NULL AND lease_until IS NULL;")
@@ -445,7 +448,7 @@ test_claim_next_ignores_done_and_review() {
   first=${first##*#}
   second=$(cd "$repo" && "$CXQ" add "Review task")
   second=${second##*#}
-  (cd "$repo" && "$CXQ" done "$first" --summary "Accepted" >/dev/null)
+  (cd "$repo" && "$CXQ" "done" "$first" --summary "Accepted" >/dev/null)
   (cd "$repo" && "$CXQ" review "$second" --summary "Needs human review" >/dev/null)
 
   set +e
@@ -560,7 +563,7 @@ test_done_blocker_allows_dependent_task() {
   dependent=$(cd "$repo" && "$CXQ" add "Dependent after done" --priority 99)
   dependent=${dependent##*#}
   (cd "$repo" && "$CXQ" block "$dependent" --by "$blocker" >/dev/null)
-  (cd "$repo" && "$CXQ" done "$blocker" --summary "Accepted" >/dev/null)
+  (cd "$repo" && "$CXQ" "done" "$blocker" --summary "Accepted" >/dev/null)
 
   claimed=$(cd "$repo" && "$CXQ" claim-next --format id)
   [ "$claimed" = "$dependent" ] || fail "dependent should be claimable once blocker is done"
@@ -951,7 +954,7 @@ test_failed_remote_check_does_not_block() {
   state_set "last_update_check_at" "1000"
 
   set +e
-  output=$(cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION= "$CXQ" list 2>&1)
+  output=$(cd "$repo" && CXQ_NOW_EPOCH=90000 CXQ_TEST_LATEST_VERSION='' "$CXQ" list 2>&1)
   status=$?
   set -e
   [ "$status" -eq 0 ] || fail "failed remote check should not block normal usage. Output: $output"
@@ -1270,7 +1273,7 @@ test_doctor_reports_repo_database() {
   (cd "$repo" && "$CXQ" add "Doctor sample" >/dev/null)
   output=$(cd "$repo" && "$CXQ" doctor)
   assert_contains "$output" "/doctor-db/.cxq/tasks.db"
-  assert_contains "$output" "repo_schema_version: 4 (expected 4)"
+  assert_contains "$output" "repo_schema_version: 6 (expected 6)"
   assert_contains "$output" "repo_task_total: 1"
   assert_contains "$output" "repo_task_counts: ready=1"
   assert_contains "$output" "repo_db_integrity: ok"
@@ -1330,7 +1333,7 @@ test_reopen_returns_tasks_to_ready() {
   assert_contains "$output" "reopen reason is required"
 
   set +e
-  output=$(cd "$repo" && "$CXQ" reopen "$id" --to done --reason "nope" 2>&1)
+  output=$(cd "$repo" && "$CXQ" reopen "$id" --to "done" --reason "nope" 2>&1)
   status=$?
   set -e
   [ "$status" -ne 0 ] || fail "reopen should reject invalid targets"
@@ -1348,7 +1351,7 @@ test_reopen_returns_tasks_to_ready() {
   assert_contains "$summary" "Found a race in the refresh path" "reopen must preserve prior notes"
   assert_contains "$summary" "acceptance criteria 3 is missing" "reopen must record the reason"
 
-  (cd "$repo" && "$CXQ" done "$id" --summary "Accepted" >/dev/null)
+  (cd "$repo" && "$CXQ" "done" "$id" --summary "Accepted" >/dev/null)
   output=$(cd "$repo" && "$CXQ" reopen "$id" --to inbox --reason "regression reported")
   assert_contains "$output" "Reopened task #$id: done -> inbox"
   pass "reopen returns review and done tasks to an actionable status"
@@ -1439,8 +1442,8 @@ test_findings_lifecycle() {
 
   output=$(cd "$repo" && "$CXQ" show "$id")
   assert_contains "$output" "[high/resolved] Retry loop is unbounded"
-  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
-    fail "findings require schema version 4"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "6" ] ||
+    fail "findings require schema version 6"
   pass "findings can be added, listed, rendered, and resolved"
 }
 
@@ -1509,7 +1512,7 @@ test_done_warns_about_unfinished_work() {
   withfinding=$(cd "$repo" && "$CXQ" add "Task with finding" | sed 's/.*#//')
 
   set +e
-  output=$(cd "$repo" && "$CXQ" done "$pending" --summary "Main flow works, docs are still pending" 2>&1)
+  output=$(cd "$repo" && "$CXQ" "done" "$pending" --summary "Main flow works, docs are still pending" 2>&1)
   status=$?
   set -e
   [ "$status" -ne 0 ] || fail "done should refuse a summary that mentions pending work"
@@ -1519,19 +1522,19 @@ test_done_warns_about_unfinished_work() {
   [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $pending;")" != "done" ] ||
     fail "a warned task must not be closed without --force"
 
-  output=$(cd "$repo" && "$CXQ" done "$pending" --summary "Main flow works, docs are still pending" --force)
+  output=$(cd "$repo" && "$CXQ" "done" "$pending" --summary "Main flow works, docs are still pending" --force)
   assert_contains "$output" "Marked task #$pending done"
 
   (cd "$repo" && "$CXQ" finding add "$withfinding" --severity high --note "Auth bypass on refresh" >/dev/null)
   set +e
-  output=$(cd "$repo" && "$CXQ" done "$withfinding" --summary "Shipped" 2>&1)
+  output=$(cd "$repo" && "$CXQ" "done" "$withfinding" --summary "Shipped" 2>&1)
   status=$?
   set -e
   [ "$status" -ne 0 ] || fail "done should refuse a task with open findings"
   assert_contains "$output" "1 open finding(s)"
 
   set +e
-  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=n "$CXQ" done "$withfinding" --summary "Shipped" 2>&1)
+  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=n "$CXQ" "done" "$withfinding" --summary "Shipped" 2>&1)
   status=$?
   set -e
   [ "$status" -ne 0 ] || fail "answering no should abort an interactive close"
@@ -1540,10 +1543,10 @@ test_done_warns_about_unfinished_work() {
   [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $withfinding;")" != "done" ] ||
     fail "answering no must leave the task open"
 
-  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=y "$CXQ" done "$withfinding" --summary "Shipped" 2>&1)
+  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=y "$CXQ" "done" "$withfinding" --summary "Shipped" 2>&1)
   assert_contains "$output" "Marked task #$withfinding done"
 
-  output=$(cd "$repo" && "$CXQ" done "$clean" --summary "Implemented and verified")
+  output=$(cd "$repo" && "$CXQ" "done" "$clean" --summary "Implemented and verified")
   assert_contains "$output" "Marked task #$clean done"
   [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $clean;")" = "done" ] ||
     fail "a clean close must never be blocked"
@@ -1667,7 +1670,7 @@ test_edit_rejects_bad_input() {
 
   # Illegal status transition: ready -> done is not in the table.
   set +e
-  output=$(cd "$repo" && "$CXQ" edit "$id" --status done 2>&1); status=$?
+  output=$(cd "$repo" && "$CXQ" edit "$id" --status "done" 2>&1); status=$?
   set -e
   [ "$status" -ne 0 ] || fail "edit must reject illegal status transitions"
   assert_contains "$output" "cannot move task $id from ready to done"
@@ -1688,7 +1691,7 @@ test_edit_rejects_bad_input() {
 }
 
 test_delete_guardrails() {
-  local repo ready claimed output status
+  local repo ready claimed inbox output status
   repo="$TEST_DIR/delete"
   run_git_init "$repo"
   (cd "$repo" && "$CXQ" install >/dev/null)
@@ -1697,49 +1700,258 @@ test_delete_guardrails() {
   claimed=$(cd "$repo" && "$CXQ" add "Claimed task" | sed 's/.*#//')
   inbox=$(cd "$repo" && "$CXQ" add "Inbox task" --status inbox | sed 's/.*#//')
   (cd "$repo" && "$CXQ" claim "$claimed" --agent tester --lease 1h >/dev/null)
-  (cd "$repo" && "$CXQ" note "$ready" "a note to cascade" >/dev/null)
+  (cd "$repo" && "$CXQ" note "$ready" "a note to keep" >/dev/null)
   (cd "$repo" && "$CXQ" finding add "$ready" --severity low --note "nit" >/dev/null)
 
-  # A ready task is outside the deletable statuses, so the status guard fires.
+  # Delete still requires --force in non-interactive runs, whatever the status.
   set +e
   output=$(cd "$repo" && "$CXQ" delete "$ready" 2>&1); status=$?
   set -e
   [ "$status" -ne 0 ] || fail "a ready task must not be deletable without --force"
-  assert_contains "$output" "only inbox, wontfix, or done"
+  assert_contains "$output" "requires --force"
 
-  # An inbox task is deletable in principle, but non-interactive runs still
-  # require --force (a TTY would ask for confirmation instead).
   set +e
   output=$(cd "$repo" && "$CXQ" delete "$inbox" 2>&1); status=$?
   set -e
   [ "$status" -ne 0 ] || fail "non-interactive delete without --force must fail"
   assert_contains "$output" "requires --force"
 
-  # A claimed task cannot be deleted even with the status guard, without --force.
   set +e
   output=$(cd "$repo" && "$CXQ" delete "$claimed" 2>&1); status=$?
   set -e
   [ "$status" -ne 0 ] || fail "a claimed task must not be deletable without --force"
-  assert_contains "$output" "only inbox, wontfix, or done"
+  assert_contains "$output" "requires --force"
 
+  # On a TTY the prompt asks once: 'n' keeps the task, 'y' trashes it.
+  set +e
+  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=n "$CXQ" delete "$inbox" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "answering no at the delete prompt must keep the task"
+  assert_contains "$output" "was not deleted"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $inbox;")" = "inbox" ] ||
+    fail "a declined delete must leave the task alone"
+
+  output=$(cd "$repo" && CXQ_TEST_TTY_ANSWER=y "$CXQ" delete "$inbox")
+  assert_contains "$output" "Trashed task #$inbox (was inbox)"
+
+  # --force trashes instead of deleting: the row, its events, and its
+  # findings survive, so the task can be restored.
   output=$(cd "$repo" && "$CXQ" delete "$ready" --force)
-  assert_contains "$output" "Deleted task #$ready"
-  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE id = $ready;")" = "0" ] ||
-    fail "deleted task must be gone"
-  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $ready;")" = "0" ] ||
-    fail "delete must cascade events"
-  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_findings WHERE task_id = $ready;")" = "0" ] ||
-    fail "delete must cascade findings"
+  assert_contains "$output" "Trashed task #$ready (was ready)"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $ready;")" = "trashed" ] ||
+    fail "delete must move the task to trashed"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT trashed_from_status FROM tasks WHERE id = $ready;")" = "ready" ] ||
+    fail "delete must record the pre-trash status"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $ready;")" != "0" ] ||
+    fail "delete must keep the event history"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_findings WHERE task_id = $ready;")" = "1" ] ||
+    fail "delete must keep findings"
 
   output=$(cd "$repo" && "$CXQ" remove "$claimed" --force)
-  assert_contains "$output" "Deleted task #$claimed" "remove must be an alias of delete"
+  assert_contains "$output" "Trashed task #$claimed (was claimed)" "remove must be an alias of delete"
 
   set +e
   output=$(cd "$repo" && "$CXQ" delete 999 --force 2>&1); status=$?
   set -e
   [ "$status" -ne 0 ] || fail "deleting a missing task must fail"
   assert_contains "$output" "task not found: 999"
-  pass "delete enforces status guardrails, --force, and cascades"
+  pass "delete requires --force, asks on a TTY, and trashes instead of removing rows"
+}
+
+test_trash_restore_purge() {
+  local repo a b c output status
+  repo="$TEST_DIR/trash"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  a=$(cd "$repo" && "$CXQ" add "Trash me" --priority 80 | sed 's/.*#//')
+  b=$(cd "$repo" && "$CXQ" add "Stay ready" --priority 70 | sed 's/.*#//')
+  c=$(cd "$repo" && "$CXQ" add "Claimed one" --priority 60 | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" claim "$c" --agent tester --lease 1h >/dev/null)
+
+  # Trash hides the task from the default list and board, but --status and
+  # `cxq trash` still find it.
+  output=$(cd "$repo" && "$CXQ" delete "$a" --force)
+  assert_contains "$output" "Trashed task #$a (was ready)"
+  output=$(cd "$repo" && "$CXQ" list)
+  assert_not_contains "$output" "Trash me"
+  assert_contains "$output" "Stay ready"
+  output=$(cd "$repo" && "$CXQ" board)
+  assert_not_contains "$output" "Trash me"
+  output=$(cd "$repo" && "$CXQ" list --status trashed)
+  assert_contains "$output" "Trash me"
+  output=$(cd "$repo" && "$CXQ" trash)
+  assert_contains "$output" "Trash me"
+  assert_contains "$output" "ready"
+  output=$(cd "$repo" && "$CXQ" stats)
+  assert_contains "$output" "status_trashed: 1"
+
+  # A trashed task cannot be claimed or edited.
+  set +e
+  output=$(cd "$repo" && "$CXQ" claim "$a" --agent tester --lease 1h 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "a trashed task must not be claimable"
+  assert_contains "$output" "not available to claim"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$a" --title "Nope" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "a trashed task must not be editable"
+  assert_contains "$output" "is trashed; restore it first"
+
+  # Deleting an already-trashed task errors; restoring a live task errors.
+  set +e
+  output=$(cd "$repo" && "$CXQ" delete "$a" --force 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "deleting an already-trashed task must fail"
+  assert_contains "$output" "already trashed"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" restore "$b" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "restoring a task that is not trashed must fail"
+  assert_contains "$output" "is not trashed"
+
+  # Restore returns the task to its pre-trash status; a claimed task lands
+  # on ready because its claim was cleared when trashed.
+  output=$(cd "$repo" && "$CXQ" restore "$a")
+  assert_contains "$output" "Restored task #$a to ready"
+  output=$(cd "$repo" && "$CXQ" list)
+  assert_contains "$output" "Trash me"
+
+  output=$(cd "$repo" && "$CXQ" delete "$c" --force)
+  assert_contains "$output" "Trashed task #$c (was claimed)"
+  output=$(cd "$repo" && "$CXQ" restore "$c")
+  assert_contains "$output" "Restored task #$c to ready"
+
+  # Purge with an empty trash is a no-op success; --days 30 spares a
+  # freshly trashed task; --days 0 and --all empty the trash for real.
+  output=$(cd "$repo" && "$CXQ" trash purge)
+  assert_contains "$output" "Purged 0 trashed task(s)"
+  (cd "$repo" && "$CXQ" delete "$a" --force >/dev/null)
+  output=$(cd "$repo" && "$CXQ" trash purge --days 30)
+  assert_contains "$output" "Purged 0 trashed task(s)"
+  output=$(cd "$repo" && "$CXQ" trash purge --days 0)
+  assert_contains "$output" "Purged 1 trashed task(s)"
+  set +e
+  output=$(cd "$repo" && "$CXQ" show "$a" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "a purged task must be gone"
+  assert_contains "$output" "task not found: $a"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $a;")" = "0" ] ||
+    fail "purge must cascade events"
+  output=$(cd "$repo" && "$CXQ" trash)
+  assert_contains "$output" "(empty)"
+
+  (cd "$repo" && "$CXQ" delete "$b" --force >/dev/null)
+  output=$(cd "$repo" && "$CXQ" trash purge --all)
+  assert_contains "$output" "Purged 1 trashed task(s)"
+
+  # Invalid ids and bad --days values error like elsewhere in the CLI.
+  set +e
+  output=$(cd "$repo" && "$CXQ" restore 999 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "restoring a missing task must fail"
+  assert_contains "$output" "task not found: 999"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" trash purge --days banana 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "purge with a non-integer --days must fail"
+  assert_contains "$output" "--days must be a non-negative integer"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" trash frobnicate 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "an unknown trash subcommand must fail"
+  assert_contains "$output" "unknown trash command"
+  pass "trash hides tasks from list/board, restore returns them, purge deletes them for real"
+}
+
+test_undo_reverts_last_edit() {
+  local repo id output status
+  repo="$TEST_DIR/undo"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  id=$(cd "$repo" && "$CXQ" add "Original title" --priority 50 --due 2026-01-15 | sed 's/.*#//')
+
+  # Undo with no prior edit errors.
+  set +e
+  output=$(cd "$repo" && "$CXQ" undo "$id" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "undo with no prior edit must fail"
+  assert_contains "$output" "has nothing to undo"
+
+  # One edit, one undo: every changed field comes back.
+  (cd "$repo" && "$CXQ" edit "$id" --title "New title" --priority 90 --due 2026-12-01 >/dev/null)
+  output=$(cd "$repo" && "$CXQ" undo "$id")
+  assert_contains "$output" "Undid last edit of task #$id"
+  assert_contains "$output" "title"
+  assert_contains "$output" "priority"
+  assert_contains "$output" "due_date"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT title FROM tasks WHERE id = $id;")" = "Original title" ] ||
+    fail "undo must restore the title"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT priority FROM tasks WHERE id = $id;")" = "50" ] ||
+    fail "undo must restore the priority"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT due_date FROM tasks WHERE id = $id;")" = "2026-01-15" ] ||
+    fail "undo must restore the due date"
+
+  # A second undo finds nothing left to undo (each undo reverts one edit).
+  set +e
+  output=$(cd "$repo" && "$CXQ" undo "$id" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "a second undo must fail once the only edit is undone"
+  assert_contains "$output" "has nothing to undo"
+
+  # Two edits, two undos: each reverts only the most recent edit.
+  (cd "$repo" && "$CXQ" edit "$id" --title "Second title" >/dev/null)
+  (cd "$repo" && "$CXQ" edit "$id" --priority 10 >/dev/null)
+  output=$(cd "$repo" && "$CXQ" undo "$id")
+  assert_contains "$output" "priority"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT priority FROM tasks WHERE id = $id;")" = "50" ] ||
+    fail "undo must revert the priority edit"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT title FROM tasks WHERE id = $id;")" = "Second title" ] ||
+    fail "undo must revert only the most recent edit"
+  output=$(cd "$repo" && "$CXQ" undo "$id")
+  assert_contains "$output" "title"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT title FROM tasks WHERE id = $id;")" = "Original title" ] ||
+    fail "a second undo must revert the earlier edit"
+
+  # Undo restores a cleared due date, and a changed status.
+  (cd "$repo" && "$CXQ" edit "$id" --due-clear >/dev/null)
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COALESCE(due_date, '') FROM tasks WHERE id = $id;")" = "" ] ||
+    fail "due-clear must clear the date"
+  output=$(cd "$repo" && "$CXQ" undo "$id")
+  assert_contains "$output" "due_date"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT due_date FROM tasks WHERE id = $id;")" = "2026-01-15" ] ||
+    fail "undo must restore a cleared due date"
+
+  (cd "$repo" && "$CXQ" claim "$id" --agent tester --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" review "$id" --summary "done-ish" >/dev/null)
+  (cd "$repo" && "$CXQ" edit "$id" --status ready --reason "recheck" >/dev/null)
+  output=$(cd "$repo" && "$CXQ" undo "$id")
+  assert_contains "$output" "status"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $id;")" = "review" ] ||
+    fail "undo must restore the previous status"
+
+  # Undo on a trashed task errors (restore first); every undo logs one event.
+  (cd "$repo" && "$CXQ" delete "$id" --force >/dev/null)
+  set +e
+  output=$(cd "$repo" && "$CXQ" undo "$id" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "undo on a trashed task must fail"
+  assert_contains "$output" "is trashed; restore it first"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $id AND event_type = 'undone';")" = "5" ] ||
+    fail "each undo must log exactly one undone event"
+
+  # Invalid ids error like elsewhere in the CLI.
+  set +e
+  output=$(cd "$repo" && "$CXQ" undo notanid 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "undo with a non-integer id must fail"
+  assert_contains "$output" "task id must be an integer"
+  pass "undo reverts the most recent edit, one edit at a time"
 }
 
 test_board_stats_activity() {
@@ -1856,6 +2068,8 @@ test_export_and_watch() {
   [ "$status" -ne 0 ] || fail "export must reject unknown formats"
   assert_contains "$output" "export format must be json or csv"
 
+  # || true intentionally swallows the watch timeout exit.
+  # shellcheck disable=SC2015
   output=$(cd "$repo" && timeout 3 "$CXQ" watch --interval 1s 2>&1 || true)
   assert_contains "$output" "# cxq board"
   assert_contains "$output" "Exportable task"
@@ -1881,18 +2095,20 @@ INSERT INTO task_events(task_id,event_type,actor,note) VALUES(1,'created','teste
 "
 }
 
-test_schema_migration_v3_to_v4() {
+test_schema_migration_v3_to_v6() {
   local repo output
   repo="$TEST_DIR/migrate-v3"
   run_git_init "$repo"
   build_v3_db "$repo"
 
   output=$(cd "$repo" && "$CXQ" migrate)
-  assert_contains "$output" "Migrated schema v3 -> v4"
-  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
-    fail "migrate must bump schema_version to 4"
+  assert_contains "$output" "Migrated schema v3 -> v6"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "6" ] ||
+    fail "migrate must bump schema_version to 6"
   [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'due_date';")" = "1" ] ||
     fail "migrate must add the due_date column"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name IN ('trashed_from_status', 'trashed_at');")" = "2" ] ||
+    fail "migrate must add the trash columns"
   [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT title FROM tasks WHERE id = 1;")" = "Legacy task" ] ||
     fail "migrate must preserve existing tasks"
   [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = 1;")" = "1" ] ||
@@ -1904,7 +2120,7 @@ test_schema_migration_v3_to_v4() {
 
   # Idempotent: a second migrate is a no-op report, not an error.
   output=$(cd "$repo" && "$CXQ" migrate)
-  assert_contains "$output" "Migrated schema v4 -> v4"
+  assert_contains "$output" "Migrated schema v6 -> v6"
 
   # Auto-migrate on open: a fresh v3 DB migrates when any command touches it.
   repo="$TEST_DIR/migrate-auto"
@@ -1912,9 +2128,343 @@ test_schema_migration_v3_to_v4() {
   build_v3_db "$repo"
   output=$(cd "$repo" && "$CXQ" list 2>/dev/null)
   assert_contains "$output" "Legacy task"
-  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "4" ] ||
-    fail "opening a v3 queue must auto-migrate it to v4"
-  pass "schema v3 -> v4 migration preserves data and auto-migrates on open"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "6" ] ||
+    fail "opening a v3 queue must auto-migrate it to v6"
+  pass "schema v3 -> v6 migration preserves data and auto-migrates on open"
+}
+
+build_v4_db() {
+  local repo=$1
+  mkdir -p "$repo/.cxq/prompts"
+  printf 'x\n' >"$repo/.cxq/prompts/task.md"
+  printf '## Local task queue\n\nUse cxq.\n' >"$repo/AGENTS.md"
+  printf -- "-- old stock v4 schema template\nVALUES ('schema_version', '4');\n" >"$repo/.cxq/tasks.schema.sql"
+  sqlite3 -batch "$repo/.cxq/tasks.db" "
+CREATE TABLE tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,body TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'inbox' CHECK (status IN ('inbox','ready','claimed','blocked','review','done','wontfix')),priority INTEGER NOT NULL DEFAULT 50,due_date TEXT,repo_path TEXT NOT NULL,branch TEXT,allowed_paths_json TEXT NOT NULL DEFAULT '[]',tags_json TEXT NOT NULL DEFAULT '[]',deps_json TEXT NOT NULL DEFAULT '[]',acceptance TEXT NOT NULL DEFAULT '',verify_command TEXT NOT NULL DEFAULT '',claimed_by TEXT,claimed_at TEXT,lease_until TEXT,result_summary TEXT NOT NULL DEFAULT '',transcript_path TEXT,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE task_events(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER NOT NULL,event_type TEXT NOT NULL,actor TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',data_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE task_dependencies(task_id INTEGER NOT NULL,blocker_task_id INTEGER NOT NULL,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),PRIMARY KEY(task_id,blocker_task_id));
+CREATE TABLE task_findings(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER NOT NULL,severity TEXT NOT NULL DEFAULT 'medium',status TEXT NOT NULL DEFAULT 'open',note TEXT NOT NULL DEFAULT '',followup_task_id INTEGER,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE cxq_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE INDEX idx_tasks_status_priority ON tasks(status, priority DESC, created_at ASC);
+CREATE INDEX idx_tasks_repo_status ON tasks(repo_path, status);
+CREATE INDEX idx_tasks_due ON tasks(due_date);
+CREATE TRIGGER trg_tasks_updated_at AFTER UPDATE ON tasks FOR EACH ROW BEGIN UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = OLD.id; END;
+INSERT INTO cxq_meta VALUES('schema_version','4');
+INSERT INTO tasks(title,status,priority,repo_path) VALUES('Legacy task','ready',70,'$repo');
+INSERT INTO task_events(task_id,event_type,actor,note) VALUES(1,'created','tester','Legacy task');
+"
+}
+
+test_schema_migration_v4_to_v6() {
+  local repo output
+  repo="$TEST_DIR/migrate-v4"
+  run_git_init "$repo"
+  build_v4_db "$repo"
+
+  output=$(cd "$repo" && "$CXQ" migrate)
+  assert_contains "$output" "Migrated schema v4 -> v6"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "6" ] ||
+    fail "migrate must bump schema_version to 6"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name IN ('trashed_from_status', 'trashed_at');")" = "2" ] ||
+    fail "migrate must add the trash columns"
+  case "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks';")" in
+    *trashed*) ;;
+    *) fail "migrate must add 'trashed' to the status CHECK" ;;
+  esac
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_tasks_updated_at';")" = "1" ] ||
+    fail "migrate must keep the updated_at trigger"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT title FROM tasks WHERE id = 1;")" = "Legacy task" ] ||
+    fail "migrate must preserve existing tasks"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = 1;")" = "1" ] ||
+    fail "migrate must preserve events"
+  output=$(cd "$repo" && "$CXQ" list)
+  assert_contains "$output" "Legacy task"
+  # The new CHECK accepts 'trashed', so the migrated queue can trash tasks.
+  output=$(cd "$repo" && "$CXQ" delete 1 --force)
+  assert_contains "$output" "Trashed task #1 (was ready)"
+  output=$(cd "$repo" && "$CXQ" restore 1)
+  assert_contains "$output" "Restored task #1 to ready"
+
+  # Idempotent: a second migrate is a no-op report, not an error.
+  output=$(cd "$repo" && "$CXQ" migrate)
+  assert_contains "$output" "Migrated schema v6 -> v6"
+
+  # Auto-migrate on open: a fresh v4 DB migrates when any command touches it.
+  repo="$TEST_DIR/migrate-auto-v4"
+  run_git_init "$repo"
+  build_v4_db "$repo"
+  output=$(cd "$repo" && "$CXQ" list 2>&1)
+  assert_contains "$output" "migrated queue schema v4 -> v6"
+  assert_contains "$output" "Legacy task"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "6" ] ||
+    fail "opening a v4 queue must auto-migrate it to v6"
+  pass "schema v4 -> v6 migration preserves data, rebuilds the CHECK, and auto-migrates on open"
+}
+
+# Builds a hand-made schema-v5 queue DB (trashed status + trash columns,
+# no recurs column, meta = 5).
+build_v5_db() {
+  local repo=$1
+  mkdir -p "$repo/.cxq/prompts"
+  printf 'x\n' >"$repo/.cxq/prompts/task.md"
+  printf '## Local task queue\n\nUse cxq.\n' >"$repo/AGENTS.md"
+  printf -- "-- old stock v5 schema template\nVALUES ('schema_version', '5');\n" >"$repo/.cxq/tasks.schema.sql"
+  sqlite3 -batch "$repo/.cxq/tasks.db" "
+CREATE TABLE tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,body TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'inbox' CHECK (status IN ('inbox','ready','claimed','blocked','review','done','wontfix','trashed')),priority INTEGER NOT NULL DEFAULT 50,due_date TEXT,trashed_from_status TEXT,trashed_at TEXT,repo_path TEXT NOT NULL,branch TEXT,allowed_paths_json TEXT NOT NULL DEFAULT '[]',tags_json TEXT NOT NULL DEFAULT '[]',deps_json TEXT NOT NULL DEFAULT '[]',acceptance TEXT NOT NULL DEFAULT '',verify_command TEXT NOT NULL DEFAULT '',claimed_by TEXT,claimed_at TEXT,lease_until TEXT,result_summary TEXT NOT NULL DEFAULT '',transcript_path TEXT,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE task_events(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER NOT NULL,event_type TEXT NOT NULL,actor TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',data_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE task_dependencies(task_id INTEGER NOT NULL,blocker_task_id INTEGER NOT NULL,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),PRIMARY KEY(task_id,blocker_task_id));
+CREATE TABLE task_findings(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id INTEGER NOT NULL,severity TEXT NOT NULL DEFAULT 'medium',status TEXT NOT NULL DEFAULT 'open',note TEXT NOT NULL DEFAULT '',followup_task_id INTEGER,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+CREATE TABLE cxq_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE INDEX idx_tasks_status_priority ON tasks(status, priority DESC, created_at ASC);
+CREATE INDEX idx_tasks_repo_status ON tasks(repo_path, status);
+CREATE INDEX idx_tasks_due ON tasks(due_date);
+CREATE TRIGGER trg_tasks_updated_at AFTER UPDATE ON tasks FOR EACH ROW BEGIN UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = OLD.id; END;
+INSERT INTO cxq_meta VALUES('schema_version','5');
+INSERT INTO tasks(title,status,priority,repo_path) VALUES('Legacy task','ready',70,'$repo');
+INSERT INTO task_events(task_id,event_type,actor,note) VALUES(1,'created','tester','Legacy task');
+"
+}
+
+test_schema_migration_v5_to_v6() {
+  local repo output
+  repo="$TEST_DIR/migrate-v5"
+  run_git_init "$repo"
+  build_v5_db "$repo"
+
+  output=$(cd "$repo" && "$CXQ" migrate)
+  assert_contains "$output" "Migrated schema v5 -> v6"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "6" ] ||
+    fail "migrate must bump schema_version to 6"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'recurs';")" = "1" ] ||
+    fail "migrate must add the recurs column"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT title FROM tasks WHERE id = 1;")" = "Legacy task" ] ||
+    fail "migrate must preserve existing tasks"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = 1;")" = "1" ] ||
+    fail "migrate must preserve events"
+  # A migrated queue can use recurrence right away.
+  output=$(cd "$repo" && "$CXQ" add "Recurring legacy" --due 2026-03-10 --recurs daily)
+  assert_contains "$output" "Created task #2"
+
+  # Idempotent: a second migrate is a no-op report, not an error.
+  output=$(cd "$repo" && "$CXQ" migrate)
+  assert_contains "$output" "Migrated schema v6 -> v6"
+  pass "schema v5 -> v6 migration adds recurs and preserves data"
+}
+
+test_due_lists_overdue_today_tomorrow() {
+  local repo output status yesterday today tomorrow after done_id trash_id
+  repo="$TEST_DIR/due"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  yesterday=$(sqlite3 -batch -noheader :memory: "SELECT date('now', '-1 day');")
+  today=$(sqlite3 -batch -noheader :memory: "SELECT date('now');")
+  tomorrow=$(sqlite3 -batch -noheader :memory: "SELECT date('now', '+1 day');")
+  after=$(sqlite3 -batch -noheader :memory: "SELECT date('now', '+2 days');")
+
+  (cd "$repo" && "$CXQ" add "Overdue task" --due "$yesterday" >/dev/null)
+  (cd "$repo" && "$CXQ" add "Today task" --due "$today" >/dev/null)
+  (cd "$repo" && "$CXQ" add "Tomorrow task" --due "$tomorrow" >/dev/null)
+  (cd "$repo" && "$CXQ" add "Day after task" --due "$after" >/dev/null)
+  (cd "$repo" && "$CXQ" add "No due task" >/dev/null)
+  done_id=$(cd "$repo" && "$CXQ" add "Done overdue task" --due "$yesterday" | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" done "$done_id" --force >/dev/null)
+  trash_id=$(cd "$repo" && "$CXQ" add "Trashed overdue task" --due "$yesterday" | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" delete "$trash_id" --force >/dev/null)
+  (cd "$repo" && "$CXQ" add "Wontfix overdue task" --due "$yesterday" --status wontfix >/dev/null)
+
+  output=$(cd "$repo" && "$CXQ" due)
+  assert_contains "$output" "Overdue:"
+  assert_contains "$output" "Due today:"
+  assert_contains "$output" "Due tomorrow:"
+  assert_contains "$output" "Overdue task"
+  assert_contains "$output" "Today task"
+  assert_contains "$output" "Tomorrow task"
+  assert_not_contains "$output" "Day after task"
+  assert_not_contains "$output" "No due task"
+  assert_not_contains "$output" "Done overdue task"
+  assert_not_contains "$output" "Trashed overdue task"
+  assert_not_contains "$output" "Wontfix overdue task"
+  # Section placement: each task under its own heading, not another's.
+  printf '%s' "$output" | sed -n '/^Overdue:/,/^Due today:/p' | grep -q "Overdue task" ||
+    fail "overdue task must sit under the Overdue heading"
+  printf '%s' "$output" | sed -n '/^Overdue:/,/^Due today:/p' | grep -q "Today task" &&
+    fail "today task must not sit under the Overdue heading"
+  printf '%s' "$output" | sed -n '/^Due today:/,/^Due tomorrow:/p' | grep -q "Today task" ||
+    fail "today task must sit under the Due today heading"
+  printf '%s' "$output" | sed -n '/^Due tomorrow:/,$p' | grep -q "Tomorrow task" ||
+    fail "tomorrow task must sit under the Due tomorrow heading"
+
+  # `cxq stats` counts the same overdue set: the trashed overdue task
+  # above must not inflate it (only "Overdue task" is overdue).
+  output=$(cd "$repo" && "$CXQ" stats)
+  assert_contains "$output" "overdue: 1"
+
+  # The formats agree with the table output.
+  output=$(cd "$repo" && "$CXQ" due --format json)
+  assert_contains "$output" '"due_group":"overdue"'
+  assert_contains "$output" '"due_group":"today"'
+  assert_contains "$output" '"due_group":"tomorrow"'
+  assert_not_contains "$output" "Day after task"
+  output=$(cd "$repo" && "$CXQ" due --format md)
+  assert_contains "$output" "| Overdue task |"
+  assert_contains "$output" "| Today task |"
+  assert_contains "$output" "| Tomorrow task |"
+  assert_not_contains "$output" "Day after task"
+  set +e
+  output=$(cd "$repo" && "$CXQ" due --format bogus 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "an unknown due format must fail"
+  assert_contains "$output" "invalid format: bogus"
+  pass "due lists overdue, today, and tomorrow with exact boundaries"
+}
+
+test_recurrence_daily_weekly_monthly() {
+  local repo output status daily weekly monthly monthly_mid next_id
+  repo="$TEST_DIR/recurrence"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  daily=$(cd "$repo" && "$CXQ" add "Daily chore" --due 2026-03-10 --recurs daily --priority 70 --tag ops --files "src/a" --body "Do it daily" --acceptance "done daily" | sed 's/.*#//')
+  weekly=$(cd "$repo" && "$CXQ" add "Weekly chore" --due 2026-03-10 --recurs weekly | sed 's/.*#//')
+  monthly=$(cd "$repo" && "$CXQ" add "Monthly chore" --due 2026-01-31 --recurs monthly | sed 's/.*#//')
+  monthly_mid=$(cd "$repo" && "$CXQ" add "Mid-month chore" --due 2026-03-15 --recurs monthly | sed 's/.*#//')
+
+  # The claim on the completed task must not leak into the next occurrence.
+  (cd "$repo" && "$CXQ" claim "$daily" --agent tester --lease 1h >/dev/null)
+  output=$(cd "$repo" && "$CXQ" done "$daily" --force)
+  assert_contains "$output" "Marked task #$daily done"
+  assert_contains "$output" "Created next occurrence #"
+  next_id=$(printf '%s' "$output" | sed -n 's/.*Created next occurrence #\([0-9]*\).*/\1/p')
+  [ -n "$next_id" ] || fail "done must report the next occurrence id"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT due_date FROM tasks WHERE id = $next_id;")" = "2026-03-11" ] ||
+    fail "daily recurrence must advance one day"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT status FROM tasks WHERE id = $next_id;")" = "ready" ] ||
+    fail "next occurrence must start ready"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COALESCE(claimed_by, '') FROM tasks WHERE id = $next_id;")" = "" ] ||
+    fail "next occurrence must not inherit the claim"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT title FROM tasks WHERE id = $next_id;")" = "Daily chore" ] ||
+    fail "next occurrence must inherit the title"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT body FROM tasks WHERE id = $next_id;")" = "Do it daily" ] ||
+    fail "next occurrence must inherit the body"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT priority FROM tasks WHERE id = $next_id;")" = "70" ] ||
+    fail "next occurrence must inherit the priority"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT tags_json FROM tasks WHERE id = $next_id;")" = '["ops"]' ] ||
+    fail "next occurrence must inherit the tags"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT allowed_paths_json FROM tasks WHERE id = $next_id;")" = '["src/a"]' ] ||
+    fail "next occurrence must inherit the allowed paths"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT acceptance FROM tasks WHERE id = $next_id;")" = "done daily" ] ||
+    fail "next occurrence must inherit the acceptance criteria"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT recurs FROM tasks WHERE id = $next_id;")" = "daily" ] ||
+    fail "next occurrence must carry the recurs value"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM task_events WHERE task_id = $daily AND event_type = 'recurrence';")" = "1" ] ||
+    fail "completing a recurring task must log one recurrence event"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT note FROM task_events WHERE task_id = $daily AND event_type = 'recurrence';")" = "next occurrence #$next_id (due 2026-03-11, recurs daily)" ] ||
+    fail "recurrence event must name the next occurrence and its due date"
+
+  # A second done on the same task must not spawn a duplicate.
+  output=$(cd "$repo" && "$CXQ" done "$daily" --force)
+  case "$output" in
+    *"next occurrence"*) fail "a second done must not create another occurrence" ;;
+  esac
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT COUNT(*) FROM tasks WHERE title = 'Daily chore';")" = "2" ] ||
+    fail "exactly one next occurrence per done"
+
+  # Weekly advances 7 days; monthly clamps Jan 31 -> Feb 28 and keeps
+  # mid-month days unchanged.
+  output=$(cd "$repo" && "$CXQ" done "$weekly" --force)
+  next_id=$(printf '%s' "$output" | sed -n 's/.*Created next occurrence #\([0-9]*\).*/\1/p')
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT due_date FROM tasks WHERE id = $next_id;")" = "2026-03-17" ] ||
+    fail "weekly recurrence must advance seven days"
+  output=$(cd "$repo" && "$CXQ" done "$monthly" --force)
+  next_id=$(printf '%s' "$output" | sed -n 's/.*Created next occurrence #\([0-9]*\).*/\1/p')
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT due_date FROM tasks WHERE id = $next_id;")" = "2026-02-28" ] ||
+    fail "monthly recurrence must clamp Jan 31 to Feb 28"
+  output=$(cd "$repo" && "$CXQ" done "$monthly_mid" --force)
+  next_id=$(printf '%s' "$output" | sed -n 's/.*Created next occurrence #\([0-9]*\).*/\1/p')
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT due_date FROM tasks WHERE id = $next_id;")" = "2026-04-15" ] ||
+    fail "monthly recurrence must keep a mid-month day"
+
+  # followup --close is a done path too: it closes the parent and spawns.
+  output=$(cd "$repo" && "$CXQ" followup "$next_id" "Leftover" --close)
+  assert_contains "$output" "Closed task #$next_id"
+  assert_contains "$output" "Created next occurrence #"
+  pass "recurrence creates the next occurrence on done with exact date math"
+}
+
+test_recurrence_validation_and_clear() {
+  local repo id output status
+  repo="$TEST_DIR/recurrence-validation"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" add "Bad interval" --due 2026-12-01 --recurs yearly 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "an invalid recurs value must fail on add"
+  assert_contains "$output" "invalid recurrence: yearly"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" add "No due recur" --recurs daily 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "recurring without a due date must fail on add"
+  assert_contains "$output" "recurring tasks require a due date"
+
+  id=$(cd "$repo" && "$CXQ" add "Plain task" | sed 's/.*#//')
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" --recurs hourly 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "an invalid recurs value must fail on edit"
+  assert_contains "$output" "invalid recurrence: hourly"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" --recurs daily 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "setting recurs on a dateless task must fail on edit"
+  assert_contains "$output" "recurring tasks require a due date"
+
+  output=$(cd "$repo" && "$CXQ" edit "$id" --due 2026-12-01 --recurs weekly)
+  assert_contains "$output" "recurs: (empty) -> weekly"
+  output=$(cd "$repo" && "$CXQ" show "$id")
+  printf '%s' "$output" | grep -A1 '^## Recurrence$' | grep -q '^weekly$' ||
+    fail "show must render the recurrence value"
+
+  set +e
+  output=$(cd "$repo" && "$CXQ" edit "$id" --due-clear 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "clearing the due date of a recurring task must fail"
+  assert_contains "$output" "recurring tasks require a due date"
+
+  # --recurs none clears it, and undo puts it back.
+  output=$(cd "$repo" && "$CXQ" edit "$id" --recurs none)
+  assert_contains "$output" "recurs: weekly -> (empty)"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT recurs FROM tasks WHERE id = $id;")" = "" ] ||
+    fail "recurs none must clear the column"
+  output=$(cd "$repo" && "$CXQ" edit "$id" --recurs daily)
+  assert_contains "$output" "recurs: (empty) -> daily"
+  output=$(cd "$repo" && "$CXQ" undo "$id")
+  assert_contains "$output" "recurs"
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT recurs FROM tasks WHERE id = $id;")" = "" ] ||
+    fail "undo must revert the recurs change"
+  pass "recurrence validation, clearing, and undo work"
+}
+
+test_recurrence_via_edit_status_done() {
+  local repo id output next_id
+  repo="$TEST_DIR/recurrence-edit-done"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+
+  id=$(cd "$repo" && "$CXQ" add "Edit-done chore" --due 2026-03-10 --recurs daily | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" claim "$id" --agent tester --lease 1h >/dev/null)
+  (cd "$repo" && "$CXQ" review "$id" --summary "did it" >/dev/null)
+  output=$(cd "$repo" && "$CXQ" edit "$id" --status done --reason "accepted")
+  assert_contains "$output" "status: review -> done"
+  assert_contains "$output" "Created next occurrence #"
+  next_id=$(printf '%s' "$output" | sed -n 's/.*Created next occurrence #\([0-9]*\).*/\1/p')
+  [ "$(sqlite3 -batch -noheader "$repo/.cxq/tasks.db" "SELECT due_date FROM tasks WHERE id = $next_id;")" = "2026-03-11" ] ||
+    fail "edit --status done must spawn the next occurrence one day later"
+  pass "recurrence fires on edit --status done"
 }
 
 test_legacy_codex_dir_migrates_to_cxq() {
@@ -2022,7 +2572,7 @@ test_server_smoke_and_remote_mode() {
   output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" add "Remote CLI task" --priority 60 --tag remote)
   assert_contains "$output" "Created task #2"
 
-  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" edit 2 --title "Remote CLI task edited" --tags-add done)
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" edit 2 --title "Remote CLI task edited" --tags-add "done")
   assert_contains "$output" "title: Remote CLI task -> Remote CLI task edited"
   assert_contains "$output" "tags: remote -> remote,done"
 
@@ -2044,6 +2594,369 @@ test_server_smoke_and_remote_mode() {
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   pass "server smoke test and remote-mode CLI round-trip work"
+}
+
+test_server_due_and_recurrence() {
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required for the server test"
+  command -v curl >/dev/null 2>&1 || fail "curl is required for the remote test"
+  local port db="$TEST_DIR/due-server.db" pid output status yesterday today tomorrow
+  port=$(free_port)
+  rm -f "$db" "$db-wal" "$db-shm"
+  yesterday=$(sqlite3 -batch -noheader :memory: "SELECT date('now', '-1 day');")
+  today=$(sqlite3 -batch -noheader :memory: "SELECT date('now');")
+  tomorrow=$(sqlite3 -batch -noheader :memory: "SELECT date('now', '+1 day');")
+
+  # The server must add the recurs column to a queue created before it
+  # existed: build the DB with the pre-recurrence task columns only.
+  sqlite3 -batch "$db" "
+CREATE TABLE tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,body TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'inbox',priority INTEGER NOT NULL DEFAULT 50,due_date TEXT,repo_path TEXT NOT NULL,branch TEXT,allowed_paths_json TEXT NOT NULL DEFAULT '[]',tags_json TEXT NOT NULL DEFAULT '[]',deps_json TEXT NOT NULL DEFAULT '[]',acceptance TEXT NOT NULL DEFAULT '',verify_command TEXT NOT NULL DEFAULT '',claimed_by TEXT,claimed_at TEXT,lease_until TEXT,result_summary TEXT NOT NULL DEFAULT '',transcript_path TEXT,created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+"
+
+  CXQ_TOKEN="test-token-due" python3 "$ROOT/server/cxq_server.py" --port "$port" --db "$db" >"$TEST_DIR/due-server.log" 2>&1 &
+  pid=$!
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+
+  # Recurring task over HTTP, plus one due today and one due tomorrow.
+  output=$(curl -s -H "Authorization: Bearer test-token-due" -H "Content-Type: application/json" \
+    -d "{\"title\":\"Server recurring\",\"due_date\":\"$yesterday\",\"recurs\":\"daily\"}" \
+    "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" '"recurs": "daily"'
+  output=$(curl -s -H "Authorization: Bearer test-token-due" -H "Content-Type: application/json" \
+    -d "{\"title\":\"Server today\",\"due_date\":\"$today\"}" \
+    "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" '"title": "Server today"'
+  output=$(curl -s -H "Authorization: Bearer test-token-due" -H "Content-Type: application/json" \
+    -d "{\"title\":\"Server tomorrow\",\"due_date\":\"$tomorrow\"}" \
+    "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" '"title": "Server tomorrow"'
+
+  output=$(curl -s -H "Authorization: Bearer test-token-due" "http://127.0.0.1:$port/api/v1/due")
+  printf '%s' "$output" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert [t["title"] for t in d["overdue"]] == ["Server recurring"], d; assert [t["title"] for t in d["today"]] == ["Server today"], d; assert [t["title"] for t in d["tomorrow"]] == ["Server tomorrow"], d' ||
+    fail "due endpoint must group overdue/today/tomorrow"
+
+  # Validation errors over HTTP.
+  output=$(curl -s -H "Authorization: Bearer test-token-due" -H "Content-Type: application/json" \
+    -d '{"title":"Bad interval","due_date":"2026-12-01","recurs":"hourly"}' \
+    "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" "invalid recurrence: hourly"
+  output=$(curl -s -H "Authorization: Bearer test-token-due" -H "Content-Type: application/json" \
+    -d '{"title":"No due recur","recurs":"daily"}' \
+    "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" "recurring tasks require a due date"
+
+  # Marking the recurring task done spawns the next occurrence (due today).
+  output=$(curl -s -H "Authorization: Bearer test-token-due" -H "Content-Type: application/json" \
+    -X POST -d '{"summary":"done","force":true}' \
+    "http://127.0.0.1:$port/api/v1/tasks/1/done")
+  assert_contains "$output" '"next_occurrence_id": 4'
+  assert_contains "$output" "\"next_occurrence_due\": \"$today\""
+  output=$(curl -s -H "Authorization: Bearer test-token-due" "http://127.0.0.1:$port/api/v1/tasks/4")
+  assert_contains "$output" '"status": "ready"'
+  assert_contains "$output" '"recurs": "daily"'
+
+  # Dashboard serves the overdue badge element and the recurs field.
+  output=$(curl -s "http://127.0.0.1:$port/")
+  assert_contains "$output" 'id="overdue-badge"'
+  assert_contains "$output" 'id="m-recurs"'
+  assert_contains "$output" 'Overdue: " + s.overdue'
+
+  # Remote-mode CLI round-trip: due groups, add --recurs, done spawns.
+  # (The next occurrence of "Server recurring" still carries that title
+  # and is due today, so it shows under Due today.)
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-due" "$CXQ" due)
+  assert_contains "$output" "Overdue:"
+  assert_contains "$output" "Due today:"
+  assert_contains "$output" "Server recurring"
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-due" "$CXQ" add "Remote recurring" --due "$yesterday" --recurs weekly)
+  assert_contains "$output" "Created task #5"
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-due" "$CXQ" done 5 --force)
+  assert_contains "$output" "Marked task #5 done"
+  assert_contains "$output" "Created next occurrence #6"
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "server due endpoint, recurrence, badge, and remote due work"
+}
+
+test_server_per_agent_tokens() {
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required for the server test"
+  command -v curl >/dev/null 2>&1 || fail "curl is required for the remote test"
+  local port db="$TEST_DIR/tokens.db" pid output status token_alpha token_alpha2
+  port=$(free_port)
+  rm -f "$db" "$db-wal" "$db-shm"
+
+  CXQ_TOKEN="legacy-token-abc" python3 "$ROOT/server/cxq_server.py" --port "$port" --db "$db" >"$TEST_DIR/tokens-server.log" 2>&1 &
+  pid=$!
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+
+  # Unknown and missing tokens are rejected with 401.
+  output=$(curl -s -w " %{http_code}" -H "Authorization: Bearer nope-not-a-token" "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" "401"
+  output=$(curl -s -w " %{http_code}" "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" "401"
+
+  # Token management runs on the server host against the server DB.
+  output=$("$CXQ" tokens list --db "$db")
+  assert_contains "$output" "No per-agent tokens yet"
+
+  output=$("$CXQ" tokens add alpha --db "$db")
+  assert_contains "$output" "Token for agent alpha"
+  token_alpha=$(printf '%s' "$output" | tail -n 1)
+  [ -n "$token_alpha" ] || fail "tokens add must print the new token on its own last line"
+
+  # Duplicate add, bad agent name, and unknown-agent revoke/rotate fail.
+  set +e
+  output=$("$CXQ" tokens add alpha --db "$db" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "duplicate tokens add must fail"
+  assert_contains "$output" "already has a token"
+
+  set +e
+  output=$("$CXQ" tokens add "bad name!" --db "$db" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "tokens add with an invalid agent name must fail"
+  assert_contains "$output" "agent name must be"
+
+  set +e
+  output=$("$CXQ" tokens revoke ghost --db "$db" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "revoking an unknown agent must fail"
+  assert_contains "$output" "no token for agent 'ghost'"
+
+  set +e
+  output=$("$CXQ" tokens rotate ghost --db "$db" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "rotating an unknown agent must fail"
+  assert_contains "$output" "no token for agent 'ghost'"
+
+  output=$("$CXQ" tokens list --db "$db")
+  assert_contains "$output" "alpha"
+  assert_contains "$output" "active"
+  assert_contains "$output" "never"
+
+  # A per-agent token authenticates, and its events record the agent.
+  output=$(curl -s -H "Authorization: Bearer $token_alpha" -H "Content-Type: application/json" \
+    -d '{"title":"Alpha task"}' "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" '"title": "Alpha task"'
+  assert_contains "$output" '"actor": "alpha"'
+
+  output=$(curl -s -H "Authorization: Bearer $token_alpha" -H "Content-Type: application/json" \
+    -X POST -d '{"note":"hello from alpha"}' "http://127.0.0.1:$port/api/v1/tasks/1/note")
+  assert_contains "$output" '"noted": 1'
+  output=$(curl -s -H "Authorization: Bearer $token_alpha" "http://127.0.0.1:$port/api/v1/activity?limit=5")
+  assert_contains "$output" '"actor": "alpha"'
+
+  # Remote-mode CLI works with a per-agent token as CXQ_REMOTE_TOKEN.
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="$token_alpha" "$CXQ" remote status)
+  assert_contains "$output" "reachable: yes"
+
+  # last-used is recorded after the token is used.
+  output=$("$CXQ" tokens list --db "$db")
+  assert_not_contains "$output" "never"
+
+  # The legacy CXQ_TOKEN still works and keeps the old actor behaviour.
+  output=$(curl -s -H "Authorization: Bearer legacy-token-abc" -H "Content-Type: application/json" \
+    -d '{"title":"Legacy task"}' "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" '"title": "Legacy task"'
+  assert_contains "$output" '"actor": "remote"'
+
+  # Revoke: the token is rejected with 401, and re-revoking fails.
+  output=$("$CXQ" tokens revoke alpha --db "$db")
+  assert_contains "$output" "Revoked token for agent alpha"
+  output=$(curl -s -w " %{http_code}" -H "Authorization: Bearer $token_alpha" "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" "401"
+  output=$("$CXQ" tokens list --db "$db")
+  assert_contains "$output" "revoked"
+
+  set +e
+  output=$("$CXQ" tokens revoke alpha --db "$db" 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "revoking an already-revoked token must fail"
+  assert_contains "$output" "already revoked"
+
+  # Rotate: the old token stays rejected, the new one works.
+  output=$("$CXQ" tokens rotate alpha --db "$db")
+  assert_contains "$output" "New token for agent alpha"
+  token_alpha2=$(printf '%s' "$output" | tail -n 1)
+  [ -n "$token_alpha2" ] || fail "tokens rotate must print the new token on its own last line"
+  [ "$token_alpha2" != "$token_alpha" ] || fail "tokens rotate must issue a different token"
+  output=$(curl -s -w " %{http_code}" -H "Authorization: Bearer $token_alpha" "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" "401"
+  output=$(curl -s -H "Authorization: Bearer $token_alpha2" -H "Content-Type: application/json" \
+    -d '{"title":"Alpha task two"}' "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" '"title": "Alpha task two"'
+  assert_contains "$output" '"actor": "alpha"'
+  output=$("$CXQ" tokens list --db "$db")
+  assert_contains "$output" "active"
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "per-agent tokens authenticate, record the actor, and revoke/rotate independently"
+}
+
+test_mcp_server_smoke() {
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required for the MCP test"
+  local repo output status driver
+  repo="$TEST_DIR/mcp-repo"
+  run_git_init "$repo"
+  output=$(cd "$repo" && "$CXQ" install)
+  assert_contains "$output" "cxq installed for project"
+  output=$(cd "$repo" && "$CXQ" add "MCP smoke task" --priority 70)
+  assert_contains "$output" "Created task #1"
+
+  # Drive the server over stdio: initialize, notification, tools/list,
+  # one tools/call per tool, an unknown method, and a malformed line.
+  # The driver asserts every response and the clean EOF exit.
+  driver="$TEST_DIR/mcp_driver.py"
+  cat >"$driver" <<'PYEOF'
+import json
+import subprocess
+import sys
+
+server_path, repo, expected_version = sys.argv[1], sys.argv[2], sys.argv[3]
+
+requests = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+     "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": {"name": "cxq-test", "version": "0"}}},
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+     "params": {"name": "list_tasks", "arguments": {}}},
+    {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+     "params": {"name": "add_task",
+                "arguments": {"title": "MCP added task", "priority": 80,
+                              "tags": ["mcp"]}}},
+    {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+     "params": {"name": "claim_task", "arguments": {"id": 2}}},
+    {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+     "params": {"name": "note",
+                "arguments": {"id": 2, "text": "hello from mcp"}}},
+    {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+     "params": {"name": "update_task",
+                "arguments": {"id": 2, "priority": 90}}},
+    {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+     "params": {"name": "board", "arguments": {}}},
+    {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+     "params": {"name": "stats", "arguments": {}}},
+    {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+     "params": {"name": "claim_task", "arguments": {"id": 999}}},
+    {"jsonrpc": "2.0", "id": 11, "method": "bogus/method"},
+    "this is not json",
+    {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+     "params": {"name": "nope", "arguments": {}}},
+]
+
+stdin = "\n".join(
+    r if isinstance(r, str) else json.dumps(r) for r in requests
+) + "\n"
+
+proc = subprocess.run(
+    [sys.executable, server_path],
+    input=stdin,
+    capture_output=True,
+    text=True,
+    cwd=repo,
+    timeout=60,
+)
+
+def fail(msg):
+    print("MCP driver failure: %s" % msg, file=sys.stderr)
+    print("stdout was: %s" % proc.stdout, file=sys.stderr)
+    print("stderr was: %s" % proc.stderr, file=sys.stderr)
+    sys.exit(1)
+
+if proc.returncode != 0:
+    fail("expected clean exit 0 on stdin EOF, got %d" % proc.returncode)
+if "Traceback" in proc.stderr:
+    fail("server wrote a traceback to stderr")
+
+lines = [line for line in proc.stdout.splitlines() if line.strip()]
+responses = {}
+for line in lines:
+    try:
+        resp = json.loads(line)
+    except ValueError:
+        fail("server wrote a non-JSON line: %s" % line)
+    responses[resp.get("id")] = resp
+
+# 12 requests with ids (the notification gets no reply) + 1 parse error
+# reply with id null = 13 responses.
+if len(lines) != 13:
+    fail("expected 13 response lines, got %d" % len(lines))
+
+init = responses[1]["result"]
+if init["protocolVersion"] != "2024-11-05":
+    fail("initialize must return a protocol version")
+if init["serverInfo"]["name"] != "cxq-mcp":
+    fail("initialize must identify the server as cxq-mcp")
+if init["serverInfo"]["version"] != expected_version:
+    fail("serverInfo version %r != %r"
+         % (init["serverInfo"]["version"], expected_version))
+
+tools = responses[2]["result"]["tools"]
+names = [t["name"] for t in tools]
+expected = ["list_tasks", "add_task", "claim_task", "update_task",
+            "note", "board", "stats"]
+if names != expected:
+    fail("tools/list must list the 7 tools, got %r" % names)
+
+def tool_text(resp_id):
+    resp = responses[resp_id]
+    if resp.get("result", {}).get("isError"):
+        fail("tool call %s returned an error: %s"
+             % (resp_id, resp["result"]))
+    return resp["result"]["content"][0]["text"]
+
+if "MCP smoke task" not in tool_text(3):
+    fail("list_tasks must return the queued task")
+if "Created task #2" not in tool_text(4):
+    fail("add_task must create a task")
+if "Claimed task #2 as mcp" not in tool_text(5):
+    fail("claim_task must claim with the default agent 'mcp'")
+if "Noted task #2" not in tool_text(6):
+    fail("note must append the note")
+if "priority: 80 -> 90" not in tool_text(7):
+    fail("update_task must edit the task")
+if "MCP added task" not in tool_text(8):
+    fail("board must show the claimed task")
+if "tasks_total: 2" not in tool_text(9):
+    fail("stats must count both tasks")
+
+# CLI failure surfaces as a tool error, not a crash.
+if not responses[10]["result"].get("isError"):
+    fail("claiming a missing task must be a tool error")
+if "task not found: 999" not in responses[10]["result"]["content"][0]["text"]:
+    fail("tool error must carry the CLI's stderr")
+
+# Unknown method -> -32601, malformed JSON -> -32700, unknown tool -> isError.
+if responses[11].get("error", {}).get("code") != -32601:
+    fail("unknown method must return -32601")
+if responses[None].get("error", {}).get("code") != -32700:
+    fail("malformed JSON must return -32700")
+if not responses[12]["result"].get("isError"):
+    fail("unknown tool must be a tool error")
+
+print("MCP_OK")
+PYEOF
+
+  set +e
+  output=$(cd "$repo" && CXQ_BIN="$ROOT/bin/cxq" CXQ_NO_UPDATE_CHECK=1 python3 "$driver" "$ROOT/mcp/cxq_mcp.py" "$repo" "$(current_repo_version)" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || fail "MCP smoke test failed (exit $status): $output"
+  assert_contains "$output" "MCP_OK"
+  pass "MCP server smoke test: initialize + tools/list + all 7 tools + error paths, clean EOF exit"
 }
 
 test_serve_requires_token_and_starts() {
@@ -2086,10 +2999,10 @@ test_doctor_reports_remote_mode() {
   output=$(cd "$repo" && CXQ_REMOTE_URL="http://127.0.0.1:18791" "$CXQ" doctor)
   assert_contains "$output" "remote_mode: yes"
   assert_contains "$output" "remote_url: http://127.0.0.1:18791"
-  assert_contains "$output" "repo_schema_version: 4 (expected 4)"
+  assert_contains "$output" "repo_schema_version: 6 (expected 6)"
   output=$(cd "$repo" && "$CXQ" doctor)
   assert_contains "$output" "remote_mode: no"
-  pass "doctor reports schema v4 and remote mode"
+  pass "doctor reports schema v6 and remote mode"
 }
 
 test_installer_and_version
@@ -2155,12 +3068,23 @@ test_concurrent_commands_do_not_lock
 test_doctor_reports_remote_mode
 test_serve_requires_token_and_starts
 test_server_smoke_and_remote_mode
-test_schema_migration_v3_to_v4
+test_server_due_and_recurrence
+test_server_per_agent_tokens
+test_mcp_server_smoke
+test_schema_migration_v3_to_v6
+test_schema_migration_v4_to_v6
+test_schema_migration_v5_to_v6
+test_due_lists_overdue_today_tomorrow
+test_recurrence_daily_weekly_monthly
+test_recurrence_validation_and_clear
+test_recurrence_via_edit_status_done
 test_legacy_codex_dir_migrates_to_cxq
 test_export_and_watch
 test_list_filters_and_formats
 test_board_stats_activity
 test_delete_guardrails
+test_trash_restore_purge
+test_undo_reverts_last_edit
 test_edit_rejects_bad_input
 test_edit_updates_fields_and_logs_diff
 

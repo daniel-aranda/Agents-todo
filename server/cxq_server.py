@@ -12,10 +12,19 @@ Auth: every /api/v1/* endpoint except /health requires
 without auth because it contains no data; it prompts for the token once and
 keeps it in localStorage, sending it as a Bearer header on API calls.
 
+Per-agent tokens (see `cxq tokens`): the server also accepts Bearer tokens
+from the `api_tokens` table in the same SQLite file, one per agent. A request
+authenticated with a per-agent token records that agent's name as the actor
+on every event it writes. The `CXQ_TOKEN` legacy token keeps working exactly
+as before and records the previous actor behaviour (the `X-CXQ-Actor`
+header, a body `actor`, or "remote"). Revoked per-agent tokens are rejected
+with 401, same as unknown tokens.
+
 Run:  cxq serve --port 8080 --db /path/to/tasks.db [--generate-token]
        (CXQ_TOKEN must be set, or pass --generate-token to `cxq serve`.)
 """
 import argparse
+import calendar
 import datetime as dt
 import json
 import os
@@ -54,6 +63,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     CHECK (status IN ('inbox','ready','claimed','blocked','review','done','wontfix')),
   priority INTEGER NOT NULL DEFAULT 50,
   due_date TEXT,
+  recurs TEXT,
   repo_path TEXT NOT NULL,
   branch TEXT,
   allowed_paths_json TEXT NOT NULL DEFAULT '[]',
@@ -109,6 +119,22 @@ CREATE TABLE IF NOT EXISTS cxq_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO cxq_meta (key, value) VALUES ('schema_version', '4');
 UPDATE cxq_meta SET value = '4' WHERE key = 'schema_version' AND CAST(value AS INTEGER) < 4;
 
+-- Per-agent API tokens (managed with `cxq tokens` on the server host).
+-- One row per agent; the full token is stored, same trust model as the
+-- single CXQ_TOKEN. A revoked row stays revoked and is never reused:
+-- rotate issues a new token value and clears the revoked flag.
+-- last_used_at is refreshed (at most once a minute) on authenticated
+-- requests. No schema-version bump: the table is additive and created
+-- idempotently by ensure_schema().
+CREATE TABLE IF NOT EXISTS api_tokens (
+  agent TEXT PRIMARY KEY,
+  token TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  last_used_at TEXT,
+  revoked INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_token ON api_tokens(token);
+
 CREATE TRIGGER IF NOT EXISTS trg_tasks_updated_at
 AFTER UPDATE ON tasks FOR EACH ROW BEGIN
   UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = OLD.id;
@@ -144,6 +170,8 @@ def ensure_schema(conn):
     cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]
     if cols and "due_date" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
+    if cols and "recurs" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN recurs TEXT")
     conn.executescript(SCHEMA_SQL)
     conn.commit()
 
@@ -156,6 +184,26 @@ def valid_due_date(value):
         return True
     except ValueError:
         return False
+
+
+def valid_recurs(value):
+    return value in ("daily", "weekly", "monthly")
+
+
+def next_due_date(due, recurs):
+    # Next due date for a recurring task, advanced from its current due
+    # date. Monthly clamps to the last day of the target month
+    # (2026-01-31 -> 2026-02-28). Mirrors advance_due_date in bin/cxq.
+    d = dt.date.fromisoformat(due)
+    if recurs == "daily":
+        return (d + dt.timedelta(days=1)).isoformat()
+    if recurs == "weekly":
+        return (d + dt.timedelta(days=7)).isoformat()
+    year, month = d.year, d.month + 1
+    if month > 12:
+        year, month = year + 1, 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return dt.date(year, month, day).isoformat()
 
 
 def parse_id(value):
@@ -182,13 +230,43 @@ def log_event(conn, task_id, event_type, actor, note="", data=None):
     )
 
 
+def create_next_occurrence(conn, row, actor):
+    # When a recurring task is marked done, create its next occurrence as
+    # a fresh task: same title/body/priority/tags/files/acceptance, due
+    # date advanced from the OLD due date, same recurs value, status
+    # ready. The claim is never inherited, and neither are dependencies
+    # or the result summary. row may be a sqlite3.Row or a plain dict of
+    # the completed task. Returns (new_id, next_due) or (None, None).
+    # Mirrors maybe_create_next_occurrence in bin/cxq. Callers must only
+    # call this on a real transition into done, so a second done cannot
+    # spawn a duplicate.
+    recurs = row["recurs"]
+    due = row["due_date"]
+    if not recurs or not due:
+        return None, None
+    nxt = next_due_date(due, recurs)
+    cur = conn.execute(
+        "INSERT INTO tasks (title, body, status, priority, due_date, recurs,"
+        " repo_path, branch, allowed_paths_json, tags_json, acceptance,"
+        " verify_command) VALUES (?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (row["title"], row["body"], row["priority"], nxt, recurs,
+         row["repo_path"], row["branch"], row["allowed_paths_json"],
+         row["tags_json"], row["acceptance"], row["verify_command"]))
+    new_id = cur.lastrowid
+    log_event(conn, new_id, "created", actor, row["title"])
+    log_event(conn, row["id"], "recurrence", actor,
+              "next occurrence #%s (due %s, recurs %s)" % (new_id, nxt, recurs))
+    return new_id, nxt
+
+
 def task_dict(row, conn=None, include_events=False):
     d = dict(row)
     d["allowed_paths"] = json_list(d.pop("allowed_paths_json", "[]"))
     d["tags"] = json_list(d.pop("tags_json", "[]"))
     d.pop("deps_json", None)
     if conn is not None:
-        today = dt.date.today().isoformat()
+        # UTC date, matching the CLI (sqlite date('now')) and the tests.
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
         d["overdue"] = bool(
             d.get("due_date") and d["due_date"] < today
             and d.get("status") not in ("done", "wontfix"))
@@ -257,10 +335,10 @@ def stats_data(conn):
     by_status = {s: 0 for s in STATUSES}
     for r in conn.execute("SELECT status, COUNT(*) n FROM tasks GROUP BY status"):
         by_status[r["status"]] = r["n"]
-    today = dt.date.today().isoformat()
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
     overdue = conn.execute(
         "SELECT COUNT(*) FROM tasks WHERE due_date IS NOT NULL"
-        " AND due_date < ? AND status NOT IN ('done','wontfix')", (today,)).fetchone()[0]
+        " AND due_date < ? AND status NOT IN ('done','wontfix','trashed')", (today,)).fetchone()[0]
     stale = conn.execute(
         "SELECT COUNT(*) FROM tasks WHERE status = 'review'"
         " AND updated_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-24 hours')").fetchone()[0]
@@ -285,6 +363,31 @@ def stats_data(conn):
     }
 
 
+def due_data(conn):
+    # Same groups as `cxq due`: overdue, due today, due tomorrow.
+    # "Today" is the UTC date, matching the overdue flag in
+    # task_dict and the overdue count in stats_data.
+    today = dt.datetime.now(dt.timezone.utc).date()
+    tomorrow = (today + dt.timedelta(days=1)).isoformat()
+    today = today.isoformat()
+    groups = {}
+    for key, where, params in (
+        ("overdue",
+         "due_date IS NOT NULL AND due_date < ?"
+         " AND status NOT IN ('done','wontfix','trashed')", (today,)),
+        ("today",
+         "due_date = ? AND status NOT IN ('done','wontfix','trashed')", (today,)),
+        ("tomorrow",
+         "due_date = ? AND status NOT IN ('done','wontfix','trashed')", (tomorrow,)),
+    ):
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE " + where +
+            " ORDER BY due_date ASC, priority DESC, created_at ASC",
+            params).fetchall()
+        groups[key] = [task_dict(r, conn) for r in rows]
+    return groups
+
+
 PENDING_WORDS = ("pending", "pendiente", "still needs", "still missing",
                  "not implemented", "no implementado", "sin terminar",
                  "left over", "leftover", "follow-up", "followup", "falta")
@@ -305,12 +408,31 @@ class ApiError(Exception):
 
 
 def actor_from(handler, body):
-    return (handler.headers.get("X-CXQ-Actor")
+    # A per-agent token names its actor: the token's agent wins over the
+    # X-CXQ-Actor header / body actor. The legacy CXQ_TOKEN leaves
+    # auth_agent unset, so its events keep the previous behaviour.
+    return (getattr(handler, "auth_agent", None)
+            or handler.headers.get("X-CXQ-Actor")
             or (body or {}).get("actor") or "remote")
+
+
+def touch_token_last_used(conn, agent):
+    # Refresh last_used_at at most once a minute: the dashboard polls
+    # every 5s, and a write per poll would churn the WAL for no benefit.
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=60))
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (cutoff.microsecond // 1000)
+    conn.execute(
+        "UPDATE api_tokens SET last_used_at = ? WHERE agent = ?"
+        " AND (last_used_at IS NULL OR last_used_at < ?)",
+        (now_iso(), agent, cutoff_iso))
+    conn.commit()
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Agent name from the per-agent token that authenticated this request,
+    # or None for the legacy CXQ_TOKEN (see actor_from).
+    auth_agent = None
 
     def log_message(self, fmt, *args):  # keep stdout clean
         sys.stderr.write("cxq-server: %s - %s\n" % (self.address_string(), fmt % args))
@@ -345,12 +467,39 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "request body must be a JSON object.")
         return body
 
+    def authenticate_token(self, presented):
+        """Return the agent name for a per-agent token, or None.
+
+        Unknown and revoked tokens both return None (401, indistinguishable
+        by design). A DB error also fails closed to None.
+        """
+        try:
+            with connect() as c:
+                row = c.execute(
+                    "SELECT agent, revoked FROM api_tokens WHERE token = ?",
+                    (presented,)).fetchone()
+                if row is None or row["revoked"]:
+                    return None
+                touch_token_last_used(c, row["agent"])
+                return row["agent"]
+        except sqlite3.Error:
+            return None
+
     def require_auth(self):
         if self.path.startswith("/api/v1/health") or self.path == "/":
             return
         auth = self.headers.get("Authorization") or ""
-        if not auth.startswith("Bearer ") or auth[7:] != TOKEN:
+        if not auth.startswith("Bearer ") or not auth[7:]:
             raise ApiError(401, "missing or invalid Bearer token.")
+        presented = auth[7:]
+        if presented == TOKEN:
+            # Legacy single token: keep the previous actor behaviour.
+            self.auth_agent = None
+            return
+        agent = self.authenticate_token(presented)
+        if agent is None:
+            raise ApiError(401, "missing or invalid Bearer token.")
+        self.auth_agent = agent
 
     def handle_all(self, method):
         try:
@@ -404,6 +553,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/stats" and method == "GET":
             with connect() as c:
                 return stats_data(c)
+        if path == "/api/v1/due" and method == "GET":
+            with connect() as c:
+                return due_data(c)
         if path == "/api/v1/activity" and method == "GET":
             return self.activity(qs)
         if path == "/api/v1/stale" and method == "GET":
@@ -515,16 +667,21 @@ class Handler(BaseHTTPRequestHandler):
         due = body.get("due_date")
         if due is not None and not valid_due_date(due):
             raise ApiError(400, "due date must be a valid YYYY-MM-DD date.")
+        recurs = body.get("recurs")
+        if recurs is not None and not valid_recurs(recurs):
+            raise ApiError(400, "invalid recurrence: %s (expected daily, weekly, monthly)." % recurs)
+        if recurs and not due:
+            raise ApiError(400, "recurring tasks require a due date.")
         for key in ("allowed_paths", "tags"):
             if key in body and not isinstance(body[key], list):
                 raise ApiError(400, "%s must be a JSON array." % key)
         with WRITE_LOCK:
             with connect() as c:
                 cur = c.execute(
-                    "INSERT INTO tasks (title, body, status, priority, due_date,"
+                    "INSERT INTO tasks (title, body, status, priority, due_date, recurs,"
                     " repo_path, branch, allowed_paths_json, tags_json, acceptance,"
-                    " verify_command) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (title, body.get("body", ""), status, priority, due,
+                    " verify_command) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (title, body.get("body", ""), status, priority, due, recurs,
                      body.get("repo_path", ""), body.get("branch"),
                      json.dumps(body.get("allowed_paths", [])),
                      json.dumps(body.get("tags", [])),
@@ -578,6 +735,23 @@ class Handler(BaseHTTPRequestHandler):
                     if due is not None and not valid_due_date(due):
                         raise ApiError(400, "due date must be a valid YYYY-MM-DD date.")
                     change("due_date", "due_date", due)
+                if "recurs" in body:
+                    r = body["recurs"]
+                    if r is not None and not valid_recurs(r):
+                        raise ApiError(400, "invalid recurrence: %s (expected daily, weekly, monthly)." % r)
+                    if r is None:
+                        if old["recurs"] is not None:
+                            diffs.append("recurs: %s -> (empty)" % old["recurs"])
+                            sets["recurs"] = None
+                    else:
+                        change("recurs", "recurs", r)
+                # A recurring task must always have a due date (effective
+                # values after this edit): covers setting recurs on a
+                # dateless task and clearing the due date of a recurring one.
+                eff_recurs = body.get("recurs", old["recurs"]) if "recurs" in body else old["recurs"]
+                eff_due = body.get("due_date", old["due_date"]) if "due_date" in body else old["due_date"]
+                if eff_recurs and not eff_due:
+                    raise ApiError(400, "recurring tasks require a due date.")
                 # files / tags: set, add, remove
                 files = json_list(old["allowed_paths_json"])
                 tags = json_list(old["tags_json"])
@@ -646,8 +820,14 @@ class Handler(BaseHTTPRequestHandler):
                     c.execute(sql, list(sets.values()) + [task_id])
                 diff_text = "; ".join(diffs)
                 log_event(c, task_id, "edited", actor_from(self, body), diff_text)
+                next_id, next_due = None, None
+                if sets.get("status") == "done" and old["status"] != "done":
+                    eff = dict(old)
+                    eff.update(sets)
+                    next_id, next_due = create_next_occurrence(c, eff, actor_from(self, body))
                 c.commit()
-                return {"task": get_task(c, task_id, include_events=True), "diff": diff_text}
+                return {"task": get_task(c, task_id, include_events=True), "diff": diff_text,
+                        "next_occurrence_id": next_id, "next_occurrence_due": next_due}
 
     def delete_task(self, task_id, qs):
         if qs.get("force", [""])[0] != "1":
@@ -816,8 +996,14 @@ class Handler(BaseHTTPRequestHandler):
                           " claimed_by = NULL, claimed_at = NULL, lease_until = NULL"
                           " WHERE id = ?", (summary, summary, task_id))
                 log_event(c, task_id, "done", actor_from(self, body), summary)
+                next_id, next_due = None, None
+                if row["status"] != "done":
+                    next_id, next_due = create_next_occurrence(c, row, actor_from(self, body))
                 c.commit()
-                return get_task(c, task_id, include_events=True)
+                task = get_task(c, task_id, include_events=True)
+                task["next_occurrence_id"] = next_id
+                task["next_occurrence_due"] = next_due
+                return task
 
     def task_note(self, task_id, body):
         note = body.get("note", "")
@@ -957,7 +1143,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "export format must be json or csv.")
         with connect() as c:
             rows = c.execute(
-                "SELECT id, title, body, status, priority, due_date, branch,"
+                "SELECT id, title, body, status, priority, due_date, recurs, branch,"
                 " allowed_paths_json, tags_json, acceptance, verify_command,"
                 " claimed_by, claimed_at, lease_until, result_summary,"
                 " created_at, updated_at FROM tasks ORDER BY id ASC").fetchall()
@@ -1044,6 +1230,7 @@ footer{padding:8px 16px;color:var(--muted);font-size:12px}
   <button id="btn-new">+ New task</button>
   <button id="btn-theme" class="ghost">Dark / light</button>
   <span id="counts" style="color:var(--muted);font-size:13px"></span>
+  <span id="overdue-badge" class="flag" style="font-size:13px"></span>
 </header>
 <div id="error"></div>
 <main id="board"></main>
@@ -1057,6 +1244,7 @@ footer{padding:8px 16px;color:var(--muted);font-size:12px}
   <div class="row">
     <div style="flex:1"><label>Priority</label><input id="m-priority" type="number" min="0"></div>
     <div style="flex:1"><label>Due date</label><input id="m-due" type="date"></div>
+    <div style="flex:1"><label>Recurs</label><select id="m-recurs"><option value="">never</option><option value="daily">daily</option><option value="weekly">weekly</option><option value="monthly">monthly</option></select></div>
     <div style="flex:1"><label>Status</label><select id="m-status"></select></div>
   </div>
   <label>Tags (comma-separated)</label><input id="m-tags">
@@ -1136,6 +1324,11 @@ async function load() {
       board.appendChild(col);
     });
     $("counts").textContent = total + " tasks";
+    // Queue-wide overdue badge, from /api/v1/stats (not the filtered
+    // board above): the daily "what needs attention" count. Empty when
+    // nothing is overdue. There is no push digest: the server has no
+    // scheduler by design, it only serves the count on poll.
+    api("GET", "/api/v1/stats").then(s => { $("overdue-badge").textContent = s.overdue ? ("Overdue: " + s.overdue) : ""; }).catch(() => {});
     $("error").textContent = "";
     fetch("/api/v1/health").then(r => r.json()).then(h => { $("health").textContent = "Server " + h.version + " · schema v" + h.schema_version; }).catch(() => {});
   } catch (e) { if (/401|token/i.test(e.message)) showAuth(e.message); else $("error").textContent = e.message; }
@@ -1146,7 +1339,7 @@ async function openTask(id) {
     const t = await api("GET", "/api/v1/tasks/" + id);
     $("m-id").value = t.id; $("m-title").textContent = "Task #" + t.id;
     $("m-t").value = t.title || ""; $("m-body").value = t.body || "";
-    $("m-priority").value = t.priority; $("m-due").value = t.due_date || "";
+    $("m-priority").value = t.priority; $("m-due").value = t.due_date || ""; $("m-recurs").value = t.recurs || "";
     $("m-status").value = t.status; $("m-tags").value = (t.tags || []).join(", ");
     $("m-files").value = (t.allowed_paths || []).join(", ");
     $("m-acceptance").value = t.acceptance || ""; $("m-verify").value = t.verify_command || "";
@@ -1157,7 +1350,7 @@ async function openTask(id) {
 }
 function currentForm() {
   return {title: $("m-t").value, body: $("m-body").value, priority: parseInt($("m-priority").value || "50", 10),
-    due_date: $("m-due").value || null, status: $("m-status").value,
+    due_date: $("m-due").value || null, recurs: $("m-recurs").value || null, status: $("m-status").value,
     tags: $("m-tags").value.split(",").map(s => s.trim()).filter(Boolean),
     allowed_paths: $("m-files").value.split(",").map(s => s.trim()).filter(Boolean),
     acceptance: $("m-acceptance").value, verify_command: $("m-verify").value,
@@ -1169,7 +1362,7 @@ $("m-release").onclick = async () => { const id = $("m-id").value; try { await a
 $("m-review").onclick = async () => { const id = $("m-id").value; const s = $("m-summary").value.trim(); if (!s) { alert("Review needs a summary."); return; } try { await api("POST", "/api/v1/tasks/" + id + "/review", {summary: s}); $("modal").classList.remove("open"); load(); } catch (e) { alert(e.message); } };
 $("m-done").onclick = async () => { const id = $("m-id").value; try { await api("POST", "/api/v1/tasks/" + id + "/done", {summary: $("m-summary").value.trim(), force: false}); $("modal").classList.remove("open"); load(); } catch (e) { if (confirm(e.message + "\n\nForce close anyway?")) { try { await api("POST", "/api/v1/tasks/" + id + "/done", {summary: $("m-summary").value.trim(), force: true}); $("modal").classList.remove("open"); load(); } catch (e2) { alert(e2.message); } } } };
 $("m-close").onclick = () => $("modal").classList.remove("open");
-$("btn-new").onclick = () => { $("m-id").value = ""; $("m-title").textContent = "New task"; $("m-t").value = ""; $("m-body").value = ""; $("m-priority").value = 50; $("m-due").value = ""; $("m-status").value = "ready"; $("m-tags").value = ""; $("m-files").value = ""; $("m-acceptance").value = ""; $("m-verify").value = ""; $("m-events").innerHTML = ""; $("m-save").onclick = async () => { try { const t = await api("POST", "/api/v1/tasks", {title: $("m-t").value, body: $("m-body").value, priority: parseInt($("m-priority").value || "50", 10), due_date: $("m-due").value || null, status: $("m-status").value, tags: $("m-tags").value.split(",").map(s => s.trim()).filter(Boolean), allowed_paths: $("m-files").value.split(",").map(s => s.trim()).filter(Boolean), acceptance: $("m-acceptance").value, verify_command: $("m-verify").value}); $("modal").classList.remove("open"); load(); } catch (e) { alert(e.message); } }; $("modal").classList.add("open"); };
+$("btn-new").onclick = () => { $("m-id").value = ""; $("m-title").textContent = "New task"; $("m-t").value = ""; $("m-body").value = ""; $("m-priority").value = 50; $("m-due").value = ""; $("m-recurs").value = ""; $("m-status").value = "ready"; $("m-tags").value = ""; $("m-files").value = ""; $("m-acceptance").value = ""; $("m-verify").value = ""; $("m-events").innerHTML = ""; $("m-save").onclick = async () => { try { const t = await api("POST", "/api/v1/tasks", {title: $("m-t").value, body: $("m-body").value, priority: parseInt($("m-priority").value || "50", 10), due_date: $("m-due").value || null, recurs: $("m-recurs").value || null, status: $("m-status").value, tags: $("m-tags").value.split(",").map(s => s.trim()).filter(Boolean), allowed_paths: $("m-files").value.split(",").map(s => s.trim()).filter(Boolean), acceptance: $("m-acceptance").value, verify_command: $("m-verify").value}); $("modal").classList.remove("open"); load(); } catch (e) { alert(e.message); } }; $("modal").classList.add("open"); };
 $("btn-refresh").onclick = load;
 ["q","f-status","f-tag","f-agent"].forEach(id => $(id).addEventListener("input", () => { clearTimeout(window._t); window._t = setTimeout(load, 300); }));
 load();

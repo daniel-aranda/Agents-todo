@@ -103,8 +103,12 @@ path_line_for_install_dir() {
   local install_dir=$1
 
   if [ "$install_dir" = "$HOME/.local/bin" ]; then
+    # $HOME/$PATH must stay literal in the profile line.
+    # shellcheck disable=SC2016
     printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"'
   else
+    # $PATH must stay literal in the profile line.
+    # shellcheck disable=SC2016
     printf 'export PATH="%s:$PATH"\n' "$install_dir"
   fi
 }
@@ -122,6 +126,8 @@ profile_has_cxq_path() {
     return 0
   fi
 
+  # $HOME/$PATH must stay literal in the profile line.
+  # shellcheck disable=SC2016
   if [ "$install_dir" = "$HOME/.local/bin" ] &&
     grep -F 'export PATH="$HOME/.local/bin:$PATH"' "$profile" >/dev/null 2>&1; then
     return 0
@@ -376,6 +382,14 @@ if [ -f "$server_src" ]; then
   cp "$server_src" "$prefix/lib/cxq/cxq_server.py"
   chmod 0644 "$prefix/lib/cxq/cxq_server.py"
   printf 'Installed cxq server to %s\n' "$prefix/lib/cxq/cxq_server.py"
+fi
+
+mcp_src="$script_dir/mcp/cxq_mcp.py"
+if [ -f "$mcp_src" ]; then
+  mkdir -p "$prefix/lib/cxq"
+  cp "$mcp_src" "$prefix/lib/cxq/cxq_mcp.py"
+  chmod 0644 "$prefix/lib/cxq/cxq_mcp.py"
+  printf 'Installed cxq MCP server to %s\n' "$prefix/lib/cxq/cxq_mcp.py"
 fi
 
 record_install_metadata "$script_dir" "$target"

@@ -34,6 +34,26 @@ prompt. When the work is ready for a human, the agent moves it to `review`
 — never straight to `done`. To share one queue between agent VMs instead,
 see [Shared queue: server + remote mode](#shared-queue-server--remote-mode).
 
+## What's new in 0.5.0
+
+- **Trash, restore, and undo** — `cxq delete` moves a task to trash
+  instead of removing it ([Trash, restore, and undo](#trash-restore-and-undo)):
+  `cxq restore` brings it back, `cxq trash purge` permanently deletes
+  trashed tasks older than 30 days, and `cxq undo` reverts the last edit.
+- **Schema v5** — adds the `trashed` status plus `trashed_from_status` /
+  `trashed_at` columns; v3 and v4 queues auto-migrate in place.
+- **MCP server** — `mcp/cxq_mcp.py` ([MCP server](#mcp-server-stdio-json-rpc)):
+  a stdio JSON-RPC server exposing the queue as 7 MCP tools
+  (`list_tasks`, `add_task`, `claim_task`, `update_task`, `note`,
+  `board`, `stats`), so an MCP client can work the queue directly.
+- **Due dates and recurrence** — `cxq due` ([Due dates and
+  recurrence](#due-dates-and-recurrence)): overdue, due today, and due
+  tomorrow in one view, plus an overdue count badge on the dashboard.
+  `--recurs daily|weekly|monthly` on `add`/`edit` makes a task recur:
+  marking it done creates the next occurrence automatically.
+- **Schema v6** — adds the `recurs` column; v3, v4, and v5 queues
+  auto-migrate in place.
+
 ## What's new in 0.4.0
 
 - **Edit tickets** — `cxq edit` ([Editing tasks](#editing-tasks)): title,
@@ -55,14 +75,18 @@ see [Shared queue: server + remote mode](#shared-queue-server--remote-mode).
 - [Command surface](#command-surface)
 - [Example task](#example-task)
 - [Editing tasks](#editing-tasks)
+- [Due dates and recurrence](#due-dates-and-recurrence)
+- [Trash, restore, and undo](#trash-restore-and-undo)
 - [Board, stats, and activity](#board-stats-and-activity)
 - [Shared queue: server + remote mode](#shared-queue-server--remote-mode)
+- [MCP server (stdio JSON-RPC)](#mcp-server-stdio-json-rpc)
 - [Schema versions and migration](#schema-versions-and-migration)
 - [Dependencies](#dependencies)
 - [Task statuses](#task-statuses)
 - [Findings](#findings)
 - [Agent contract](#agent-contract)
 - [Development](#development)
+- [Continuous integration](#continuous-integration)
 
 <img width="1672" height="941" alt="cxq list output showing queued tasks" src="https://github.com/user-attachments/assets/174b46e1-0048-4f17-8514-e53256d0b6bd" />
 
@@ -225,6 +249,7 @@ cxq version set 0.4.1
 cxq release prepare 0.4.1
 cxq add "Fix flaky auth refresh test"
 cxq list
+cxq due [--format json|table|md]
 cxq next
 cxq show 42
 cxq claim 42 --agent <name> --lease 2h
@@ -249,7 +274,11 @@ cxq repo 42
 cxq stale
 cxq release 42
 cxq edit 42 --title "New title" --priority 90 --due 2026-12-01
+cxq undo 42
 cxq delete 42 --force
+cxq restore 42
+cxq trash
+cxq trash purge --all
 cxq board
 cxq stats
 cxq activity --limit 20
@@ -319,7 +348,9 @@ cxq edit 42 --due-clear
 
 Flags: `--title`, `--body`, `--priority`, `--acceptance`, `--verify`,
 `--branch`, `--due YYYY-MM-DD` (validated as a real calendar date),
-`--due-clear`, `--status`, `--files` (set) / `--files-add` / `--files-remove`,
+`--due-clear`, `--recurs daily|weekly|monthly|none` (see
+[Due dates and recurrence](#due-dates-and-recurrence)), `--status`,
+`--files` (set) / `--files-add` / `--files-remove`,
 `--tags` (set) / `--tags-add` / `--tags-remove`, and `--reason`.
 At least one change flag is required; an edit that changes nothing is an
 error. Every edit logs **one** `edited` event with a human-readable diff
@@ -331,15 +362,99 @@ due date, age, lease remaining, and the full edit history.
 requires `--reason`. Use `cxq claim` to claim a task — `edit --status claimed`
 is rejected because a claim needs an agent and a lease.
 
-Deleting is deliberately guarded:
+Deleting is deliberately guarded and reversible:
 
 ~~~sh
 cxq delete 42 --force   # alias: cxq remove 42 --force
 ~~~
 
-Only `inbox`, `wontfix`, and `done` tasks can be deleted without `--force`.
 Without `--force`, a TTY asks for confirmation and a non-interactive run
-refuses. Delete cascades to the task's events, findings, and dependencies.
+refuses. Delete moves the task to trash instead of removing the row: its
+events, findings, and dependencies are kept, so it can come back whole.
+Trashed tasks do not appear in `cxq list` or `cxq board`, cannot be claimed
+or edited, and do not block other tasks. A trashed task that was claimed
+lands back on `ready` when restored, because its claim was cleared.
+
+## Due dates and recurrence
+
+Due dates exist to be noticed. `cxq due` shows what needs attention:
+
+~~~sh
+cxq due                          # overdue, due today, due tomorrow
+cxq due --format json            # flat array with a due_group field
+cxq due --format md
+~~~
+
+Boundaries are exact: overdue means due before today, today means due
+today, tomorrow means due tomorrow. Tasks without a due date never
+appear, and neither do `done`, `wontfix`, or trashed tasks. "Today" is
+SQLite `date('now')` (UTC) for the local CLI; the server's
+`/api/v1/due` endpoint and dashboard badge use the server-local date,
+matching the server's own overdue counts.
+
+Recurring tasks repeat themselves. Set the interval when creating or
+editing a task:
+
+~~~sh
+cxq add "Water the plants" --due 2026-12-01 --recurs daily
+cxq edit 42 --recurs weekly            # needs a due date already set
+cxq edit 42 --recurs none              # stop recurring
+~~~
+
+Rules:
+
+- `--recurs` accepts only `daily`, `weekly`, or `monthly`; anything
+  else is an error.
+- A recurring task must have a due date. Adding or editing one without
+  `--due` fails, and `--due-clear` on a recurring task fails too.
+- When a recurring task is marked done — via `cxq done`, via
+  `cxq edit --status done`, or via `cxq followup --close` — the next
+  occurrence is created automatically: same title, body, priority,
+  tags, allowed paths, and acceptance criteria, status `ready`, same
+  `recurs` value, and the due date advanced from the **old** due date
+  (daily +1 day, weekly +7 days, monthly +1 calendar month, clamped
+  to the last day of the target month: Jan 31 → Feb 28). The completed
+  task gets a `recurrence` event naming the new task id. The new
+  occurrence never inherits the claim, the dependencies, or the result
+  summary. Marking the same task done twice creates exactly one next
+  occurrence — only a real transition into done spawns one.
+- Restoring a trashed task to `done` does not spawn an occurrence:
+  restore is not a completion.
+
+The dashboard shows an **Overdue: N** badge in the header (from
+`/api/v1/stats`, refreshed with the board poll) and the task modal has
+a Recurs field. There is no push or email digest: the server has no
+scheduler by design — the badge is the digest. `cxq due` works in
+remote mode too, through `GET /api/v1/due`.
+
+Without `--due`, a task never recurs and never appears in `cxq due`.
+
+## Trash, restore, and undo
+
+~~~sh
+cxq trash                  # list trashed tasks, with pre-trash status and trash date
+cxq restore 42             # back to its pre-trash status
+cxq trash purge            # permanently delete tasks trashed more than 30 days ago
+cxq trash purge --days 7   # ... more than 7 days ago
+cxq trash purge --all      # empty the trash regardless of age
+cxq undo 42                # revert the most recent edit (title, priority, due date, status, ...)
+~~~
+
+`cxq list --status trashed` lists trashed tasks; `cxq stats` reports a
+`status_trashed` count. Purging is permanent — purged tasks, their events,
+findings, and dependencies are gone for real. Purging an empty trash
+succeeds and reports `Purged 0 trashed task(s)`.
+
+`cxq undo` reverts one edit at a time: a second `cxq undo` reverts the edit
+before it. It restores the exact previous field values, including a cleared
+due date and a changed status (with the claim that status change cleared).
+It errors when there is nothing to undo, when the last edit predates undo
+support, and on a trashed task — restore it first. `cxq edit` cannot move a
+task to `trashed` directly; use `cxq delete`.
+
+In remote mode, `restore`, `undo`, and `trash` are not supported yet — the
+server has no trash/undo endpoints — and fail with a clear error instead of
+touching a local database.
 
 ## Board, stats, and activity
 
@@ -411,16 +526,61 @@ options (Fly.io primary, Oracle Cloud Always Free VPS + Tailscale second),
 backup instructions (`cxq export` + volume snapshots + `sqlite3 .backup`),
 and token rotation.
 
+## MCP server (stdio JSON-RPC)
+
+`mcp/cxq_mcp.py` exposes the queue to MCP clients (Claude Code,
+Claude Desktop, …) over stdio as 7 tools:
+
+| Tool | Does |
+| --- | --- |
+| `list_tasks` | `cxq list --format json`, optional `status` filter |
+| `add_task` | `cxq add <title>` (+ `body`, `priority`, `tags`) |
+| `claim_task` | `cxq claim <id>` (`agent` defaults to `mcp`) |
+| `update_task` | `cxq edit <id>` (`title`, `body`, `priority`, `status`) |
+| `note` | `cxq note <id> <text>` |
+| `board` | `cxq board` |
+| `stats` | `cxq stats` |
+
+Point a client at it (example for Claude Code, run from the repo whose
+queue you want — the server inherits its working directory, and the
+CLI finds the project-local queue from there):
+
+~~~json
+{
+  "mcpServers": {
+    "cxq": {
+      "command": "python3",
+      "args": ["/path/to/cxq/mcp/cxq_mcp.py"]
+    }
+  }
+}
+~~~
+
+After `install.sh`, the installed copy lives at
+`<prefix>/lib/cxq/cxq_mcp.py` and can be invoked by that path instead.
+
+Design note: the server shells out to the `cxq` CLI (one invocation
+per tool call) instead of talking to SQLite itself, so the CLI stays
+the single owner of business rules, locking, and migrations. It finds
+`bin/cxq` relative to the repo root (the `mcp/` directory sits next to
+`bin/`), so it works from any working directory; set `CXQ_BIN` to point
+it at an explicit CLI path. CLI failures surface as MCP tool errors
+(`isError: true` with the CLI's stderr), never as crashes. Python 3
+standard library only (`json`, `sys`, `os`, `subprocess`), same rule as
+`server/cxq_server.py`; no network, no telemetry, no daemons. It exits
+cleanly (code 0) on stdin EOF.
+
 ## Schema versions and migration
 
-The queue schema is versioned in `cxq_meta.schema_version` (v4 in 0.4.0,
-which adds the nullable `due_date` column). `cxq install` creates v4
-databases. A v3 database is migrated in place, preserving all data:
+The queue schema is versioned in `cxq_meta.schema_version` (v6 in 0.5.0,
+which adds the `recurs` column; v5 added the `trashed` status and the
+`trashed_from_status` / `trashed_at` columns). `cxq install` creates v6
+databases. A v3, v4, or v5 database is migrated in place, preserving all data:
 
 ~~~sh
 cxq migrate        # explicit; also refreshes an old stock .cxq/tasks.schema.sql
-cxq list           # any command auto-migrates a v3 queue on open, with a notice
-cxq doctor         # reports repo_schema_version (expected 4) and remote mode
+cxq list           # any command auto-migrates a v3/v4/v5 queue on open, with a notice
+cxq doctor         # reports repo_schema_version (expected 6) and remote mode
 ~~~
 
 Databases older than v3 are not auto-migrated; they are reported by
@@ -740,7 +900,6 @@ Useful additions for later (none of these changes the core workflow):
 - a global inbox that can move captured tasks into a repo-local queue
 - an MCP wrapper once the CLI contract proves useful
 - per-project queue namespacing on one server (today: one server = one queue)
-- per-agent tokens instead of a single shared token
 
 ## Design principle
 
@@ -760,3 +919,13 @@ make test
 
 The tests install `cxq` into a temporary prefix, verify `cxq -v`, create
 temporary Git repositories, run `cxq install`, and exercise the task lifecycle.
+
+## Continuous integration
+
+`.github/workflows/test.yml` runs on every push and pull request to `main`.
+It runs `make test` and `shellcheck` on `bin/cxq`, `install.sh`, and
+`tests/run_tests.sh` on `ubuntu-latest`. Both steps must pass.
+
+Caveat: files under `.github/workflows/` cannot be pushed through the
+GitHub API by the Muse GitHub App (it gets a 403). Add or change the
+workflow file from the GitHub web UI instead.
