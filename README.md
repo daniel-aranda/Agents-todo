@@ -53,6 +53,13 @@ see [Shared queue: server + remote mode](#shared-queue-server--remote-mode).
   marking it done creates the next occurrence automatically.
 - **Schema v6** — adds the `recurs` column; v3, v4, and v5 queues
   auto-migrate in place.
+- **Server trash parity** — `DELETE /api/v1/tasks/<id>` trashes instead
+  of removing the row, with `restore` / `undo` / `trash` / `trash purge`
+  endpoints, so remote mode supports trash, restore, and undo exactly
+  like the local CLI.
+- **Daily digest** — `cxq digest` ([Daily digest](#daily-digest)): the
+  overdue + due-today + due-tomorrow summary for a cron job or pasting
+  into chat, also as `GET /api/v1/digest`.
 
 ## What's new in 0.4.0
 
@@ -388,9 +395,8 @@ cxq due --format md
 Boundaries are exact: overdue means due before today, today means due
 today, tomorrow means due tomorrow. Tasks without a due date never
 appear, and neither do `done`, `wontfix`, or trashed tasks. "Today" is
-SQLite `date('now')` (UTC) for the local CLI; the server's
-`/api/v1/due` endpoint and dashboard badge use the server-local date,
-matching the server's own overdue counts.
+SQLite `date('now')` (UTC) for the local CLI and for the server's
+`/api/v1/due` endpoint, so both agree.
 
 Recurring tasks repeat themselves. Set the interval when creating or
 editing a task:
@@ -423,11 +429,35 @@ Rules:
 
 The dashboard shows an **Overdue: N** badge in the header (from
 `/api/v1/stats`, refreshed with the board poll) and the task modal has
-a Recurs field. There is no push or email digest: the server has no
-scheduler by design — the badge is the digest. `cxq due` works in
-remote mode too, through `GET /api/v1/due`.
+a Recurs field. `cxq due` works in remote mode too, through `GET /api/v1/due`.
 
 Without `--due`, a task never recurs and never appears in `cxq due`.
+
+### Daily digest
+
+`cxq digest` is the daily reminder: overdue + due today + due tomorrow
+with a one-line summary. There is still no push or email — the server
+has no scheduler by design — so you wire the command to a cron job,
+or run it by hand and paste `--format md` into chat:
+
+~~~sh
+cxq digest                       # table, with a header and counts
+cxq digest --format md           # same, as Markdown for pasting into chat
+cxq digest --format json         # counts + flat task array, for scripts
+~~~
+
+~~~
+# crontab: every weekday at 08:00, from the repo directory
+0 8 * * 1-5 cd /path/to/repo && cxq digest
+# shared queue instead of a local one:
+0 8 * * 1-5 CXQ_REMOTE_URL=http://127.0.0.1:8080 CXQ_REMOTE_TOKEN=<token> cxq digest
+~~~
+
+When nothing is overdue or due in the next 2 days it prints
+`All clear — nothing overdue or due in the next 2 days.` instead of the
+task lists. The server exposes the same summary as `GET /api/v1/digest`
+(the same groups as `/api/v1/due`, plus `generated_at`, `date`, and the
+three counts); `cxq digest` works in remote mode through it.
 
 ## Trash, restore, and undo
 
@@ -452,9 +482,11 @@ It errors when there is nothing to undo, when the last edit predates undo
 support, and on a trashed task — restore it first. `cxq edit` cannot move a
 task to `trashed` directly; use `cxq delete`.
 
-In remote mode, `restore`, `undo`, and `trash` are not supported yet — the
-server has no trash/undo endpoints — and fail with a clear error instead of
-touching a local database.
+In remote mode, `restore`, `undo`, and `trash` work the same as locally:
+`cxq delete` trashes through the server, `cxq restore` / `cxq undo` /
+`cxq trash` / `cxq trash purge` call the matching endpoints
+(`DELETE /api/v1/tasks/<id>?force=1` trashes, `POST .../restore`,
+`POST .../undo`, `GET /api/v1/trash`, `POST /api/v1/trash/purge`).
 
 ## Board, stats, and activity
 

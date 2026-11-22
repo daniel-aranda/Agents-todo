@@ -42,7 +42,7 @@ fly deploy
 
 # 5. Check it (health is the only unauthenticated endpoint)
 curl https://cxq-queue.fly.dev/api/v1/health
-# {"status": "ok", "version": "0.4.0-dev", "schema_version": 4}
+# {"status": "ok", "version": "0.5.0-dev", "schema_version": 6}
 ~~~
 
 The dashboard is at `https://cxq-queue.fly.dev/` — paste the token once when

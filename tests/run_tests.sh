@@ -2527,8 +2527,8 @@ test_server_smoke_and_remote_mode() {
     i=$((i + 1))
   done
   output=$(curl -s "http://127.0.0.1:$port/api/v1/health")
-  assert_contains "$output" '"schema_version": 4'
-  assert_contains "$output" '"version": "0.4.0-dev"'
+  assert_contains "$output" '"schema_version": 6'
+  assert_contains "$output" '"version": "0.5.0-dev"'
 
   # Unauthenticated API access is rejected.
   set +e
@@ -2804,6 +2804,318 @@ test_server_per_agent_tokens() {
   pass "per-agent tokens authenticate, record the actor, and revoke/rotate independently"
 }
 
+test_server_trashed_tasks() {
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required for the server test"
+  command -v curl >/dev/null 2>&1 || fail "curl is required for the remote test"
+  command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 is required for the trashed-server test"
+  local port pid output status
+  port=$(free_port)
+
+  # Part 1: a CLI-trashed task must not 500 the board (regression for #13).
+  local repo="$TEST_DIR/trashed-server"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  local a b
+  a=$(cd "$repo" && "$CXQ" add "Trash me" --priority 80 --due 2000-01-01 | sed 's/.*#//')
+  b=$(cd "$repo" && "$CXQ" add "Stay ready" --priority 70 | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" delete "$a" --force >/dev/null)
+
+  local db="$repo/.cxq/tasks.db"
+  CXQ_TOKEN="test-token-xyz" python3 "$ROOT/server/cxq_server.py" --port "$port" --db "$db" >"$TEST_DIR/trashed-server.log" 2>&1 &
+  pid=$!
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  output=$(curl -s "http://127.0.0.1:$port/api/v1/health")
+  assert_contains "$output" '"schema_version": 6'
+
+  # Board: 200, no trashed column, trashed task hidden, live task shown.
+  output=$(curl -s -w " %{http_code}" -H "Authorization: Bearer test-token-xyz" "http://127.0.0.1:$port/api/v1/board")
+  assert_contains "$output" " 200"
+  assert_contains "$output" '"ready": ['
+  assert_not_contains "$output" '"trashed"'
+  assert_not_contains "$output" "Trash me"
+  assert_contains "$output" "Stay ready"
+
+  # Stats: 200, trashed counted separately, totals include it.
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" "http://127.0.0.1:$port/api/v1/stats")
+  assert_contains "$output" '"trashed": 1'
+  assert_contains "$output" '"tasks_total": 2'
+
+  # Default task list hides the trashed task; ?all=1 shows it, and the
+  # single-task view reports it as not overdue despite its past due date.
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" "http://127.0.0.1:$port/api/v1/tasks")
+  assert_not_contains "$output" "Trash me"
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" "http://127.0.0.1:$port/api/v1/tasks?all=1")
+  assert_contains "$output" "Trash me"
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" "http://127.0.0.1:$port/api/v1/tasks/$a")
+  assert_contains "$output" '"overdue": false'
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  # Part 2: the server migrates a v4 database to v6 on start (same rebuild
+  # as `cxq migrate`), preserving the old task.
+  repo="$TEST_DIR/trashed-migrate-v4"
+  run_git_init "$repo"
+  build_v4_db "$repo"
+  db="$repo/.cxq/tasks.db"
+  port=$(free_port)
+  CXQ_TOKEN="test-token-xyz" python3 "$ROOT/server/cxq_server.py" --port "$port" --db "$db" >"$TEST_DIR/trashed-migrate.log" 2>&1 &
+  pid=$!
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  output=$(curl -s "http://127.0.0.1:$port/api/v1/health")
+  assert_contains "$output" '"schema_version": 6'
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" "http://127.0.0.1:$port/api/v1/tasks")
+  assert_contains "$output" "Legacy task"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$(sqlite3 -batch -noheader "$db" "SELECT value FROM cxq_meta WHERE key = 'schema_version';")" = "6" ] ||
+    fail "server start must migrate a v4 DB to schema 6"
+  case "$(sqlite3 -batch -noheader "$db" "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks';")" in
+    *trashed*) ;;
+    *) fail "server migration must add 'trashed' to the status CHECK" ;;
+  esac
+  # The migrated queue can now trash tasks, and the board stays up.
+  output=$(cd "$repo" && "$CXQ" delete 1 --force)
+  assert_contains "$output" "Trashed task #1 (was ready)"
+  port=$(free_port)
+  CXQ_TOKEN="test-token-xyz" python3 "$ROOT/server/cxq_server.py" --port "$port" --db "$db" >"$TEST_DIR/trashed-migrate2.log" 2>&1 &
+  pid=$!
+  i=0
+  while [ "$i" -lt 20 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  output=$(curl -s -w " %{http_code}" -H "Authorization: Bearer test-token-xyz" "http://127.0.0.1:$port/api/v1/board")
+  assert_contains "$output" " 200"
+  assert_not_contains "$output" "Legacy task"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "server board/stats stay up with trashed tasks and migrate v4 DBs to v6"
+}
+
+test_server_trash_restore_undo() {
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required for the server test"
+  command -v curl >/dev/null 2>&1 || fail "curl is required for the remote test"
+  command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 is required for the trash-server test"
+  local port db="$TEST_DIR/trash-server.db" pid output status
+  port=$(free_port)
+  rm -f "$db" "$db-wal" "$db-shm"
+
+  CXQ_TOKEN="test-token-xyz" python3 "$ROOT/server/cxq_server.py" --port "$port" --db "$db" >"$TEST_DIR/trash-server.log" 2>&1 &
+  pid=$!
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  local base="http://127.0.0.1:$port" auth=(-H "Authorization: Bearer test-token-xyz")
+
+  # Create + edit over HTTP; undo reverts the edit (proves PATCH recorded
+  # the previous values), and a second undo has nothing left to revert.
+  output=$(curl -s "${auth[@]}" -H "Content-Type: application/json" \
+    -d '{"title":"Undo me","priority":80,"due_date":"2000-01-01"}' "$base/api/v1/tasks")
+  assert_contains "$output" '"title": "Undo me"'
+  output=$(curl -s "${auth[@]}" -H "Content-Type: application/json" \
+    -X PATCH -d '{"title":"Undo me edited","priority":90}' "$base/api/v1/tasks/1")
+  assert_contains "$output" "title: Undo me -> Undo me edited"
+  output=$(curl -s "${auth[@]}" -H "Content-Type: application/json" \
+    -X POST -d '{}' "$base/api/v1/tasks/1/undo")
+  assert_contains "$output" '"title": "Undo me"'
+  assert_contains "$output" '"priority": 80'
+  output=$(curl -s -w " %{http_code}" "${auth[@]}" -H "Content-Type: application/json" \
+    -X POST -d '{}' "$base/api/v1/tasks/1/undo")
+  assert_contains "$output" " 400"
+  assert_contains "$output" "nothing to undo"
+
+  # DELETE trashes instead of removing the row: events survive, the board
+  # and default list hide it, and it shows up under /trash.
+  output=$(curl -s "${auth[@]}" -X DELETE "$base/api/v1/tasks/1?force=1")
+  assert_contains "$output" '"trashed": 1'
+  assert_contains "$output" '"was": "ready"'
+  output=$(curl -s "${auth[@]}" "$base/api/v1/tasks/1")
+  assert_contains "$output" '"status": "trashed"'
+  assert_contains "$output" '"trashed_from_status": "ready"'
+  output=$(curl -s "${auth[@]}" "$base/api/v1/board")
+  assert_not_contains "$output" "Undo me"
+  output=$(curl -s "${auth[@]}" "$base/api/v1/tasks")
+  assert_not_contains "$output" "Undo me"
+  output=$(curl -s -w " %{http_code}" "${auth[@]}" -X DELETE "$base/api/v1/tasks/1?force=1")
+  assert_contains "$output" " 400"
+  assert_contains "$output" "already trashed"
+  output=$(curl -s "${auth[@]}" "$base/api/v1/trash")
+  assert_contains "$output" "Undo me"
+
+  # Undo refuses a trashed task; restore brings it back to ready.
+  output=$(curl -s -w " %{http_code}" "${auth[@]}" -H "Content-Type: application/json" \
+    -X POST -d '{}' "$base/api/v1/tasks/1/undo")
+  assert_contains "$output" " 400"
+  assert_contains "$output" "restore it first"
+  output=$(curl -s "${auth[@]}" -H "Content-Type: application/json" \
+    -X POST -d '{}' "$base/api/v1/tasks/1/restore")
+  assert_contains "$output" '"restored_to": "ready"'
+  output=$(curl -s "${auth[@]}" "$base/api/v1/tasks/1")
+  assert_contains "$output" '"status": "ready"'
+  output=$(curl -s -w " %{http_code}" "${auth[@]}" -H "Content-Type: application/json" \
+    -X POST -d '{}' "$base/api/v1/tasks/1/restore")
+  assert_contains "$output" " 400"
+  assert_contains "$output" "is not trashed"
+
+  # Purge: only tasks older than --days go; --all takes the rest.
+  output=$(curl -s "${auth[@]}" -H "Content-Type: application/json" \
+    -d '{"title":"Old trash","priority":60}' "$base/api/v1/tasks")
+  assert_contains "$output" '"id": 2'
+  output=$(curl -s "${auth[@]}" -H "Content-Type: application/json" \
+    -d '{"title":"Fresh trash","priority":50}' "$base/api/v1/tasks")
+  assert_contains "$output" '"id": 3'
+  curl -s "${auth[@]}" -X DELETE "$base/api/v1/tasks/2?force=1" >/dev/null
+  curl -s "${auth[@]}" -X DELETE "$base/api/v1/tasks/3?force=1" >/dev/null
+  sqlite3 -batch "$db" "UPDATE tasks SET trashed_at = '2000-01-01T00:00:00.000Z' WHERE id = 2;"
+  output=$(curl -s -w " %{http_code}" "${auth[@]}" -H "Content-Type: application/json" \
+    -X POST -d '{"days": -1}' "$base/api/v1/trash/purge")
+  assert_contains "$output" " 400"
+  assert_contains "$output" "non-negative integer"
+  output=$(curl -s "${auth[@]}" -H "Content-Type: application/json" \
+    -X POST -d '{"days": 30}' "$base/api/v1/trash/purge")
+  assert_contains "$output" '"purged": 1'
+  output=$(curl -s "${auth[@]}" "$base/api/v1/trash")
+  assert_not_contains "$output" "Old trash"
+  assert_contains "$output" "Fresh trash"
+  output=$(curl -s -w " %{http_code}" "${auth[@]}" "$base/api/v1/tasks/2")
+  assert_contains "$output" " 404"
+  output=$(curl -s "${auth[@]}" -H "Content-Type: application/json" \
+    -X POST -d '{"all": true}' "$base/api/v1/trash/purge")
+  assert_contains "$output" '"purged": 1'
+  output=$(curl -s "${auth[@]}" "$base/api/v1/trash")
+  assert_contains "$output" '"tasks": []'
+
+  # Remote-mode CLI round-trip: delete trashes, restore/undo/trash work.
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="$base" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" add "Remote trash me" --priority 60)
+  assert_contains "$output" "Created task #4"
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="$base" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" delete 4 --force)
+  assert_contains "$output" "Trashed task #4 (was ready). Restore with 'cxq restore 4'."
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="$base" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" trash)
+  assert_contains "$output" "Remote trash me"
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="$base" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" restore 4)
+  assert_contains "$output" "Restored task #4 to ready"
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="$base" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" edit 4 --title "Remote trash me edited")
+  assert_contains "$output" "title: Remote trash me -> Remote trash me edited"
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="$base" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" undo 4)
+  assert_contains "$output" "Undid last edit of task #4: title"
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="$base" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" delete 4 --force)
+  assert_contains "$output" "Trashed task #4 (was ready)."
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="$base" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" trash purge --all)
+  assert_contains "$output" "Purged 1 trashed task(s)"
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "server trash/restore/undo/purge match the CLI, including remote mode"
+}
+
+test_digest_command_and_endpoint() {
+  command -v python3 >/dev/null 2>&1 || fail "python3 is required for the server test"
+  command -v curl >/dev/null 2>&1 || fail "curl is required for the remote test"
+  command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 is required for the digest test"
+  local repo output status yesterday today tomorrow
+  repo="$TEST_DIR/digest"
+  run_git_init "$repo"
+  (cd "$repo" && "$CXQ" install >/dev/null)
+  yesterday=$(sqlite3 -batch -noheader :memory: "SELECT date('now', '-1 day');")
+  today=$(sqlite3 -batch -noheader :memory: "SELECT date('now');")
+  tomorrow=$(sqlite3 -batch -noheader :memory: "SELECT date('now', '+1 day');")
+
+  # Empty queue: header + counts + the all-clear line, no sections.
+  output=$(cd "$repo" && "$CXQ" digest)
+  assert_contains "$output" "# cxq digest — $today"
+  assert_contains "$output" "Overdue: 0 | Due today: 0 | Due tomorrow: 0"
+  assert_contains "$output" "All clear — nothing overdue or due in the next 2 days."
+  # Empty JSON is still valid JSON (sqlite3 -json prints nothing for zero
+  # rows; both digest and due default to []).
+  output=$(cd "$repo" && "$CXQ" digest --format json)
+  assert_contains "$output" '"tasks": []'
+  output=$(cd "$repo" && "$CXQ" due --format json)
+  assert_contains "$output" "[]"
+
+  # One task per group; done / trashed / wontfix / dateless stay out.
+  (cd "$repo" && "$CXQ" add "Overdue one" --priority 80 --due "$yesterday" >/dev/null)
+  (cd "$repo" && "$CXQ" add "Due today" --priority 70 --due "$today" >/dev/null)
+  (cd "$repo" && "$CXQ" add "Due tomorrow" --priority 60 --due "$tomorrow" >/dev/null)
+  local done_id trash_id
+  done_id=$(cd "$repo" && "$CXQ" add "Done overdue" --priority 90 --due "$yesterday" | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" done "$done_id" --force >/dev/null)
+  trash_id=$(cd "$repo" && "$CXQ" add "Trashed overdue" --priority 90 --due "$yesterday" | sed 's/.*#//')
+  (cd "$repo" && "$CXQ" delete "$trash_id" --force >/dev/null)
+  (cd "$repo" && "$CXQ" add "Wontfix overdue" --priority 90 --due "$yesterday" --status wontfix >/dev/null)
+  (cd "$repo" && "$CXQ" add "No due date" --priority 50 >/dev/null)
+
+  output=$(cd "$repo" && "$CXQ" digest)
+  assert_contains "$output" "Overdue: 1 | Due today: 1 | Due tomorrow: 1"
+  assert_contains "$output" "Overdue one"
+  assert_contains "$output" "Due today"
+  assert_contains "$output" "Due tomorrow"
+  assert_not_contains "$output" "Done overdue"
+  assert_not_contains "$output" "Trashed overdue"
+  assert_not_contains "$output" "Wontfix overdue"
+  assert_not_contains "$output" "No due date"
+  assert_not_contains "$output" "All clear"
+  output=$(cd "$repo" && "$CXQ" digest --format md)
+  assert_contains "$output" "# cxq digest — $today"
+  assert_contains "$output" "| Overdue one |"
+  output=$(cd "$repo" && "$CXQ" digest --format json)
+  assert_contains "$output" "\"overdue_count\": 1"
+  assert_contains "$output" "\"today_count\": 1"
+  assert_contains "$output" "\"tomorrow_count\": 1"
+  assert_contains "$output" '"due_group":"overdue"'
+  assert_contains "$output" '"due_group":"today"'
+  assert_contains "$output" '"due_group":"tomorrow"'
+  assert_not_contains "$output" "Done overdue"
+  set +e
+  output=$(cd "$repo" && "$CXQ" digest --format yaml 2>&1); status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "digest --format yaml must fail"
+  assert_contains "$output" "invalid format: yaml"
+
+  # Server endpoint + remote mode round-trip.
+  local port db="$repo/.cxq/tasks.db" pid
+  port=$(free_port)
+  CXQ_TOKEN="test-token-xyz" python3 "$ROOT/server/cxq_server.py" --port "$port" --db "$db" >"$TEST_DIR/digest-server.log" 2>&1 &
+  pid=$!
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if curl -s --max-time 2 "http://127.0.0.1:$port/api/v1/health" >/dev/null 2>&1; then break; fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  output=$(curl -s -H "Authorization: Bearer test-token-xyz" "http://127.0.0.1:$port/api/v1/digest")
+  assert_contains "$output" '"overdue_count": 1'
+  assert_contains "$output" "\"date\": \"$today\""
+  assert_contains "$output" "Overdue one"
+  assert_not_contains "$output" "Done overdue"
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" digest)
+  assert_contains "$output" "# cxq digest — $today"
+  assert_contains "$output" "Overdue: 1 | Due today: 1 | Due tomorrow: 1"
+  assert_contains "$output" "Overdue one"
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" digest --format json)
+  assert_contains "$output" '"tomorrow_count": 1'
+  output=$(cd "$TEST_DIR" && CXQ_REMOTE_URL="http://127.0.0.1:$port" CXQ_REMOTE_TOKEN="test-token-xyz" "$CXQ" digest --format md)
+  assert_contains "$output" "| Due today |"
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "cxq digest prints the daily summary locally, over HTTP, and in remote mode"
+}
+
 test_mcp_server_smoke() {
   command -v python3 >/dev/null 2>&1 || fail "python3 is required for the MCP test"
   local repo output status driver
@@ -3070,6 +3382,9 @@ test_serve_requires_token_and_starts
 test_server_smoke_and_remote_mode
 test_server_due_and_recurrence
 test_server_per_agent_tokens
+test_server_trashed_tasks
+test_server_trash_restore_undo
+test_digest_command_and_endpoint
 test_mcp_server_smoke
 test_schema_migration_v3_to_v6
 test_schema_migration_v4_to_v6
