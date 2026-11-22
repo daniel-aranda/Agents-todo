@@ -1,10 +1,13 @@
 # cxq
 
-`cxq` is a tiny work queue for Codex-style coding agents.
+`cxq` is a work queue for coding agents — and the humans who review them.
 
-It is not a project manager, kanban board, or issue tracker. It is a SQLite
-queue with a small command-line interface, designed so humans and agents
-can coordinate implementation work without editing ad hoc TODO files.
+Give an agent a task with a clear title, acceptance criteria, allowed
+paths, and a verification command, and `cxq` tracks it from `inbox` to
+`done`: claim it with a lease, work it, send it to `review`, and close it
+only when a human accepts it. It is a SQLite queue with a small CLI, a
+kanban board, and (since v0.4.0) a shared server — not a full project
+manager or issue tracker, and deliberately not one.
 
 By default the queue is repo-local (`.codex/tasks.db`). Since v0.4.0 it can
 also run **shared**: one small server owns the SQLite file and every agent
@@ -12,26 +15,59 @@ VM talks to it over HTTPS (`cxq serve` + `CXQ_REMOTE_URL`), so all agents
 see the same board. The CLI, the dashboard, and the API all edit the same
 tasks, with the same validation and the same event history.
 
-<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/174b46e1-0048-4f17-8514-e53256d0b6bd" />
-
-
-The intended flow is simple:
+## Quickstart (60 seconds)
 
 ~~~sh
 git clone https://github.com/daniel-aranda/Agents-todo.git
 cd Agents-todo
-./install.sh
-~~~
+./install.sh                    # installs the global `cxq` command (macOS or Linux)
 
-That installs a global `cxq` command on macOS or Linux. Then, inside any Git project:
-
-~~~sh
-cxq -v
 cd /path/to/your/project
-cxq install
+cxq install                     # creates .codex/tasks.db for this repo
+cxq add "Fix flaky auth refresh test" --priority 80
+cxq board                       # see the queue
+cxq claim-next --agent codex --lease 2h --format prompt
 ~~~
 
-`cxq install` initializes the queue for that project.
+That last command hands the next task to your agent, with the full task
+prompt. When the work is ready for a human, the agent moves it to `review`
+— never straight to `done`. To share one queue between agent VMs instead,
+see [Shared queue: server + remote mode](#shared-queue-server--remote-mode).
+
+## What's new in 0.4.0
+
+- **Edit tickets** — `cxq edit` ([Editing tasks](#editing-tasks)): title,
+  priority, due date, tags, files, acceptance, and status, with a diff in
+  the event history. `cxq delete` with guardrails.
+- **See the queue** — `cxq board`, `cxq stats`, `cxq activity`
+  ([Board, stats, and activity](#board-stats-and-activity)).
+- **Shared queue** — `cxq serve` + remote mode
+  ([Shared queue](#shared-queue-server--remote-mode)): one server owns the
+  SQLite file; every agent VM sees the same board over HTTPS.
+- **Linux support** — `install.sh` now works on macOS and Linux.
+
+## Contents
+
+- [What it looks like](#what-it-looks-like)
+- [Requirements](#requirements)
+- [Why cxq exists](#why-cxq-exists)
+- [Project-local queues](#project-local-queues)
+- [Command surface](#command-surface)
+- [Example task](#example-task)
+- [Editing tasks](#editing-tasks)
+- [Board, stats, and activity](#board-stats-and-activity)
+- [Shared queue: server + remote mode](#shared-queue-server--remote-mode)
+- [Schema versions and migration](#schema-versions-and-migration)
+- [Dependencies](#dependencies)
+- [Task statuses](#task-statuses)
+- [Findings](#findings)
+- [Agent contract](#agent-contract)
+- [Development](#development)
+
+<img width="1672" height="941" alt="cxq list output showing queued tasks" src="https://github.com/user-attachments/assets/174b46e1-0048-4f17-8514-e53256d0b6bd" />
+
+*Above: `cxq list` in a project queue (screenshot from an earlier version;
+the commands shown still work the same way).*
 
 ## What it looks like
 
@@ -69,6 +105,15 @@ No package manager or Node.js runtime is required. `python3` and `curl` are
 only needed for the optional shared server (`cxq serve`) and remote mode
 (`CXQ_REMOTE_URL`); the local queue still needs nothing but `bash` + `sqlite3`.
 
+By default, `install.sh` installs to `$HOME/.local/bin`. If that directory is
+not already on `PATH`, the installer prints the shell profile update needed for
+your shell. You can choose a prefix explicitly:
+
+~~~sh
+PREFIX=/opt/homebrew ./install.sh
+./install.sh --prefix "$HOME/.local"
+~~~
+
 ## Why cxq exists
 
 Agents are better workers when tasks are explicit.
@@ -94,25 +139,6 @@ cxq         = API
 AGENTS.md   = agent protocol
 Codex       = worker
 Git         = project boundary
-~~~
-
-## Current platform
-
-`cxq` runs on macOS and Linux (agents' cloud VMs are Linux).
-
-The project is designed for people who clone this repository, run
-`install.sh`, and then use the installed `cxq` command from other local Git
-projects.
-
-By default, `install.sh` installs to `$HOME/.local/bin`. If that directory is
-not already on `PATH`, the installer prints the shell profile update needed for
-your shell.
-
-You can choose a prefix explicitly:
-
-~~~sh
-PREFIX=/opt/homebrew ./install.sh
-./install.sh --prefix "$HOME/.local"
 ~~~
 
 ## Project-local queues
@@ -171,7 +197,8 @@ project boundary explicit.
 
 ## Command surface
 
-The current version of `cxq` is intentionally small:
+The current version of `cxq` is intentionally focused — one queue, one
+workflow, no extra concepts to learn:
 
 ~~~sh
 cxq -v
@@ -182,8 +209,8 @@ cxq update
 cxq update --status
 cxq update --check
 cxq version bump patch
-cxq version set 0.2.1
-cxq release prepare 0.2.1
+cxq version set 0.4.1
+cxq release prepare 0.4.1
 cxq add "Fix flaky auth refresh test"
 cxq list
 cxq next
@@ -590,16 +617,16 @@ cxq version --plain
 cxq version bump patch
 cxq version bump minor
 cxq version bump major
-cxq version set 0.2.1
+cxq version set 0.4.1
 ~~~
 
 Release preparation is explicit and local-first:
 
 ~~~sh
-cxq release prepare 0.2.1
-cxq release tag 0.2.1
-cxq release publish 0.2.1
-cxq release 0.2.1
+cxq release prepare 0.4.1
+cxq release tag 0.4.1
+cxq release publish 0.4.1
+cxq release 0.4.1
 ~~~
 
 `cxq release prepare` verifies the requested version and writes release notes to
@@ -692,7 +719,7 @@ human, watcher, or agent touches the queue.
 
 ## Future direction
 
-After the MVP works, useful additions include:
+Useful additions for later (none of these changes the core workflow):
 
 - `cxq run-next` to claim, render a prompt, call `codex exec`, and move the task
   to review
